@@ -4,11 +4,20 @@ from __future__ import annotations
 
 import base64
 import io
+import sys
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader
+
+
+def _get_templates_dir() -> Path:
+    """Resolve templates dir — works both in dev and PyInstaller bundle."""
+    if getattr(sys, "frozen", False):
+        # PyInstaller extracts datas to sys._MEIPASS
+        return Path(sys._MEIPASS) / "image_dedup" / "report" / "templates"
+    return Path(__file__).parent / "templates"
 from PIL import Image
 
 from ..engine.hasher import DuplicateGroup
@@ -37,7 +46,7 @@ def _shorten_path(path: str, max_len: int = 50) -> str:
 class ReportGenerator:
     def __init__(self, thumbnail_size: tuple[int, int] = (150, 150)):
         self._thumb_size = thumbnail_size
-        templates_dir = Path(__file__).parent / "templates"
+        templates_dir = _get_templates_dir()
         self._env = Environment(
             loader=FileSystemLoader(str(templates_dir)),
             autoescape=True,
