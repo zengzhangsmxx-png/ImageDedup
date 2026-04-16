@@ -12,7 +12,7 @@ src_dir = os.path.join("src", "image_dedup")
 templates_dir = os.path.join(src_dir, "report", "templates")
 
 a = Analysis(
-    [os.path.join(src_dir, "main.py")],
+    ["run.py"],
     pathex=["src"],
     binaries=[],
     datas=[
