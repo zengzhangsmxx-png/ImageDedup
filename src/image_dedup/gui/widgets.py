@@ -1,14 +1,24 @@
-"""Custom widgets — ImageViewer, ThresholdSlider, DropListWidget."""
+"""Custom widgets — ImageViewer, ThresholdSlider, DropTreeWidget."""
 
 from __future__ import annotations
 
+import shutil
+import zipfile
 from pathlib import Path
 
 import cv2
 import numpy as np
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap
-from PyQt6.QtWidgets import QHBoxLayout, QLabel, QListWidget, QSlider, QWidget
+from PyQt6.QtWidgets import (
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QSlider,
+    QTreeWidget,
+    QTreeWidgetItem,
+    QWidget,
+)
 
 
 def numpy_to_qpixmap(arr: np.ndarray) -> QPixmap:
@@ -96,18 +106,88 @@ class ThresholdSlider(QWidget):
         return self._slider.value()
 
 
-class DropListWidget(QListWidget):
-    """QListWidget that accepts file/folder drag-and-drop."""
+ARCHIVE_EXTENSIONS = {".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".tgz", ".tar.gz", ".tar.bz2"}
+ACCEPTED_EXTENSIONS = {
+    ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".tif",
+    ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".tgz",
+    ".xlsx", ".xls", ".pdf",
+}
 
-    ACCEPTED_EXTENSIONS = {
-        ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".tif",
-        ".zip", ".xlsx", ".xls", ".pdf",
-    }
+
+def _is_archive(p: Path) -> bool:
+    name = p.name.lower()
+    if name.endswith(".tar.gz") or name.endswith(".tar.bz2"):
+        return True
+    return p.suffix.lower() in {".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".tgz"}
+
+
+def _extract_archive(archive_path: Path, dest_dir: Path):
+    """Extract archive to dest_dir. Supports ZIP, RAR, 7z, tar/gz/bz2."""
+    suffix = archive_path.suffix.lower()
+    name = archive_path.name.lower()
+
+    if suffix == ".zip":
+        import zipfile
+        with zipfile.ZipFile(archive_path, "r") as zf:
+            zf.extractall(dest_dir)
+    elif suffix == ".rar":
+        import rarfile
+        with rarfile.RarFile(str(archive_path), "r") as rf:
+            rf.extractall(str(dest_dir))
+    elif suffix == ".7z":
+        import py7zr
+        with py7zr.SevenZipFile(str(archive_path), "r") as sz:
+            sz.extractall(str(dest_dir))
+    elif suffix in (".tar", ".tgz") or name.endswith(".tar.gz") or name.endswith(".tar.bz2"):
+        import tarfile
+        with tarfile.open(str(archive_path), "r:*") as tf:
+            tf.extractall(dest_dir, filter="data")
+    elif suffix == ".gz":
+        import gzip
+        out_path = dest_dir / archive_path.stem
+        with gzip.open(archive_path, "rb") as f_in, open(out_path, "wb") as f_out:
+            shutil.copyfileobj(f_in, f_out)
+    elif suffix == ".bz2":
+        import bz2
+        out_path = dest_dir / archive_path.stem
+        with bz2.open(archive_path, "rb") as f_in, open(out_path, "wb") as f_out:
+            shutil.copyfileobj(f_in, f_out)
+
+
+def _recursive_extract(archive_path: Path, dest_dir: Path):
+    """Extract archive, then recursively extract any nested archives inside."""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        _extract_archive(archive_path, dest_dir)
+    except Exception:
+        return
+
+    for f in list(dest_dir.rglob("*")):
+        if f.is_file() and _is_archive(f):
+            nested_dest = f.parent / f.stem
+            _recursive_extract(f, nested_dest)
+            try:
+                f.unlink()
+            except OSError:
+                pass
+
+
+class DropTreeWidget(QTreeWidget):
+    """Tree widget for source management with drag-drop, auto-expand folders and auto-extract archives."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setHeaderLabels(["来源", "类型", "数量"])
+        self.setColumnCount(3)
+        header = self.header()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self.setAcceptDrops(True)
-        self.setDragDropMode(QListWidget.DragDropMode.DropOnly)
+        self.setDragDropMode(QTreeWidget.DragDropMode.DropOnly)
+        self.setRootIsDecorated(True)
+        self.setAlternatingRowColors(True)
+        self._extracted_dirs: list[Path] = []
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
@@ -130,6 +210,116 @@ class DropListWidget(QListWidget):
             if not local:
                 continue
             p = Path(local)
-            if p.is_dir() or (p.is_file() and p.suffix.lower() in self.ACCEPTED_EXTENSIONS):
-                self.addItem(local)
+            if p.is_dir():
+                self.add_folder(p)
+            elif p.is_file() and p.suffix.lower() in ACCEPTED_EXTENSIONS:
+                if _is_archive(p):
+                    self.add_archive(p)
+                else:
+                    self.add_file(p)
         event.acceptProposedAction()
+
+    def add_folder(self, folder: Path):
+        """Add a folder, expanding its sub-folders as child nodes."""
+        item = QTreeWidgetItem([folder.name, "文件夹", ""])
+        item.setToolTip(0, str(folder))
+        item.setData(0, Qt.ItemDataRole.UserRole, str(folder))
+        item.setCheckState(0, Qt.CheckState.Checked)
+
+        sub_dirs = sorted([d for d in folder.iterdir() if d.is_dir()])
+        img_count = sum(1 for f in folder.iterdir()
+                        if f.is_file() and f.suffix.lower() in {
+                            ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".tif"})
+
+        if sub_dirs:
+            for sd in sub_dirs:
+                self._add_subfolder(item, sd)
+        item.setText(2, f"{img_count} 张" if img_count else "")
+        self.addTopLevelItem(item)
+        item.setExpanded(True)
+
+    def _add_subfolder(self, parent_item: QTreeWidgetItem, folder: Path):
+        img_count = sum(1 for f in folder.rglob("*")
+                        if f.is_file() and f.suffix.lower() in {
+                            ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".tif"})
+        child = QTreeWidgetItem([folder.name, "子文件夹", f"{img_count} 张" if img_count else ""])
+        child.setToolTip(0, str(folder))
+        child.setData(0, Qt.ItemDataRole.UserRole, str(folder))
+        child.setCheckState(0, Qt.CheckState.Checked)
+
+        sub_dirs = sorted([d for d in folder.iterdir() if d.is_dir()])
+        for sd in sub_dirs:
+            self._add_subfolder(child, sd)
+
+        parent_item.addChild(child)
+
+    def add_archive(self, archive_path: Path):
+        """Extract archive to sibling directory, then add as tree node."""
+        dest_dir = archive_path.parent / archive_path.stem
+        _recursive_extract(archive_path, dest_dir)
+        self._extracted_dirs.append(dest_dir)
+
+        item = QTreeWidgetItem([archive_path.name, "压缩包", ""])
+        item.setToolTip(0, str(dest_dir))
+        item.setData(0, Qt.ItemDataRole.UserRole, str(dest_dir))
+        item.setCheckState(0, Qt.CheckState.Checked)
+
+        sub_dirs = sorted([d for d in dest_dir.iterdir() if d.is_dir()])
+        img_count = self._count_images(dest_dir)
+
+        if sub_dirs:
+            for sd in sub_dirs:
+                self._add_subfolder(item, sd)
+
+        item.setText(2, f"{img_count} 张" if img_count else "")
+        self.addTopLevelItem(item)
+        item.setExpanded(True)
+
+    def add_file(self, file_path: Path):
+        """Add a single file (image, xlsx, pdf)."""
+        item = QTreeWidgetItem([file_path.name, "文件", "1"])
+        item.setToolTip(0, str(file_path))
+        item.setData(0, Qt.ItemDataRole.UserRole, str(file_path))
+        item.setCheckState(0, Qt.CheckState.Checked)
+        self.addTopLevelItem(item)
+
+    def _count_images(self, folder: Path) -> int:
+        return sum(1 for f in folder.rglob("*")
+                   if f.is_file() and f.suffix.lower() in {
+                       ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".tif"})
+
+    def get_checked_paths(self) -> list[str]:
+        """Return all checked source paths (for scanning)."""
+        paths = []
+        self._collect_checked(None, paths)
+        return paths
+
+    def _collect_checked(self, parent_item, paths: list[str]):
+        if parent_item is None:
+            for i in range(self.topLevelItemCount()):
+                item = self.topLevelItem(i)
+                self._collect_item(item, paths)
+        else:
+            for i in range(parent_item.childCount()):
+                item = parent_item.child(i)
+                self._collect_item(item, paths)
+
+    def _collect_item(self, item: QTreeWidgetItem, paths: list[str]):
+        if item.checkState(0) == Qt.CheckState.Checked:
+            path = item.data(0, Qt.ItemDataRole.UserRole)
+            if path:
+                has_checked_children = False
+                for i in range(item.childCount()):
+                    if item.child(i).checkState(0) == Qt.CheckState.Checked:
+                        has_checked_children = True
+                        break
+                if has_checked_children:
+                    self._collect_checked(item, paths)
+                else:
+                    paths.append(path)
+        elif item.checkState(0) == Qt.CheckState.PartiallyChecked:
+            self._collect_checked(item, paths)
+
+    @property
+    def extracted_dirs(self) -> list[Path]:
+        return self._extracted_dirs

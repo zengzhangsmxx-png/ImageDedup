@@ -45,6 +45,8 @@ a = Analysis(
         "openpyxl",
         "fitz",
         "pymupdf",
+        "rarfile",
+        "py7zr",
         "PyQt6",
         "PyQt6.QtCore",
         "PyQt6.QtGui",

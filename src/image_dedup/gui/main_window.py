@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 from PyQt6.QtCore import QObject, QThread, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
@@ -28,7 +29,7 @@ from ..engine.scanner import Scanner
 from .forensic_dialog import ForensicDialog
 from .image_viewer_dialog import ImageViewerDialog
 from .results_view import ResultsView
-from .widgets import DropListWidget, ThresholdSlider
+from .widgets import DropTreeWidget, ThresholdSlider
 
 
 @dataclass
@@ -174,7 +175,7 @@ class MainWindow(QMainWindow):
 
         # Source list
         layout.addWidget(QLabel("图片来源:"))
-        self._source_list = DropListWidget()
+        self._source_list = DropTreeWidget()
         self._source_list.setMinimumWidth(250)
         layout.addWidget(self._source_list, 1)
 
@@ -239,7 +240,7 @@ class MainWindow(QMainWindow):
     def _add_folder(self):
         path = QFileDialog.getExistingDirectory(self, "选择图片文件夹")
         if path:
-            self._source_list.addItem(path)
+            self._source_list.add_folder(Path(path))
 
     def _add_files(self):
         paths, _ = QFileDialog.getOpenFileNames(
@@ -248,24 +249,30 @@ class MainWindow(QMainWindow):
             "文档文件 (*.xlsx *.xls *.pdf);;所有文件 (*)",
         )
         for p in paths:
-            self._source_list.addItem(p)
+            self._source_list.add_file(Path(p))
 
     def _add_archive(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "选择压缩包", "",
-            "ZIP 压缩包 (*.zip);;所有文件 (*)",
+            "压缩包 (*.zip *.rar *.7z *.tar *.gz *.bz2 *.tgz);;所有文件 (*)",
         )
         if path:
-            self._source_list.addItem(path)
+            self._source_list.add_archive(Path(path))
 
     def _remove_source(self):
         for item in self._source_list.selectedItems():
-            self._source_list.takeItem(self._source_list.row(item))
+            parent = item.parent()
+            if parent:
+                parent.removeChild(item)
+            else:
+                idx = self._source_list.indexOfTopLevelItem(item)
+                if idx >= 0:
+                    self._source_list.takeTopLevelItem(idx)
 
     # --- Scan ---
 
     def _on_scan(self):
-        sources = [self._source_list.item(i).text() for i in range(self._source_list.count())]
+        sources = self._source_list.get_checked_paths()
         if not sources:
             QMessageBox.warning(self, "提示", "请先添加图片来源")
             return
