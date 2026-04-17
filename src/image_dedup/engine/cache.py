@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS hash_cache (
     phash       TEXT NOT NULL,
     dhash       TEXT NOT NULL,
     ahash       TEXT NOT NULL,
+    phash_top   TEXT NOT NULL DEFAULT '',
     width       INTEGER,
     height      INTEGER,
     computed_at REAL NOT NULL,
@@ -50,11 +51,16 @@ class HashCache:
     def _init_db(self):
         conn = self._conn()
         conn.executescript(_SCHEMA)
+        # Migrate: add phash_top column if missing (old databases)
+        try:
+            conn.execute("SELECT phash_top FROM hash_cache LIMIT 1")
+        except sqlite3.OperationalError:
+            conn.execute("ALTER TABLE hash_cache ADD COLUMN phash_top TEXT NOT NULL DEFAULT ''")
         conn.commit()
 
     def get(self, file_path: str, file_size: int, mtime: float) -> dict | None:
         row = self._conn().execute(
-            "SELECT md5, sha256, phash, dhash, ahash, width, height, computed_at "
+            "SELECT md5, sha256, phash, dhash, ahash, phash_top, width, height, computed_at "
             "FROM hash_cache WHERE file_path=? AND file_size=? AND mtime=?",
             (file_path, file_size, mtime),
         ).fetchone()
@@ -62,18 +68,18 @@ class HashCache:
             return None
         return dict(
             md5=row[0], sha256=row[1], phash=row[2], dhash=row[3],
-            ahash=row[4], width=row[5], height=row[6], computed_at=row[7],
+            ahash=row[4], phash_top=row[5], width=row[6], height=row[7], computed_at=row[8],
         )
 
     def put(self, file_path: str, file_size: int, mtime: float, hashes: dict):
         self._conn().execute(
             "INSERT OR REPLACE INTO hash_cache "
-            "(file_path, file_size, mtime, md5, sha256, phash, dhash, ahash, width, height, computed_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "(file_path, file_size, mtime, md5, sha256, phash, dhash, ahash, phash_top, width, height, computed_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (file_path, file_size, mtime,
              hashes["md5"], hashes["sha256"], hashes["phash"],
-             hashes["dhash"], hashes["ahash"], hashes["width"],
-             hashes["height"], hashes["computed_at"]),
+             hashes["dhash"], hashes["ahash"], hashes.get("phash_top", ""),
+             hashes["width"], hashes["height"], hashes["computed_at"]),
         )
         self._conn().commit()
 
@@ -81,11 +87,12 @@ class HashCache:
         conn = self._conn()
         conn.executemany(
             "INSERT OR REPLACE INTO hash_cache "
-            "(file_path, file_size, mtime, md5, sha256, phash, dhash, ahash, width, height, computed_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "(file_path, file_size, mtime, md5, sha256, phash, dhash, ahash, phash_top, width, height, computed_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             [
                 (fp, fs, mt, h["md5"], h["sha256"], h["phash"],
-                 h["dhash"], h["ahash"], h["width"], h["height"], h["computed_at"])
+                 h["dhash"], h["ahash"], h.get("phash_top", ""),
+                 h["width"], h["height"], h["computed_at"])
                 for fp, fs, mt, h in items
             ],
         )
@@ -104,14 +111,14 @@ class HashCache:
             for fp, fs, mt in chunk:
                 params.extend([fp, fs, mt])
             rows = conn.execute(
-                "SELECT file_path, md5, sha256, phash, dhash, ahash, width, height, computed_at "
+                "SELECT file_path, md5, sha256, phash, dhash, ahash, phash_top, width, height, computed_at "
                 f"FROM hash_cache WHERE (file_path, file_size, mtime) IN ({placeholders})",
                 params,
             ).fetchall()
             for row in rows:
                 results[row[0]] = dict(
                     md5=row[1], sha256=row[2], phash=row[3], dhash=row[4],
-                    ahash=row[5], width=row[6], height=row[7], computed_at=row[8],
+                    ahash=row[5], phash_top=row[6], width=row[7], height=row[8], computed_at=row[9],
                 )
         return results
 

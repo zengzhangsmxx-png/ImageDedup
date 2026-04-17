@@ -27,6 +27,7 @@ class ImageHashes:
     phash: str
     dhash: str
     ahash: str
+    phash_top: str
     file_size: int
     width: int
     height: int
@@ -39,6 +40,7 @@ class DuplicateGroup:
     detection_method: str  # "exact", "perceptual", "feature"
     similarity_score: float
     files: list[ImageHashes] = field(default_factory=list)
+    multi_account: bool = False
 
 
 def _compute_single(file_path: str) -> dict | None:
@@ -59,9 +61,14 @@ def _compute_single(file_path: str) -> dict | None:
         dh = str(imagehash.dhash(img))
         ah = str(imagehash.average_hash(img))
 
+        # Top 8% crop hash — captures status bar differences on phone screenshots
+        top_h = max(1, int(h * 0.08))
+        top_crop = img.crop((0, 0, w, top_h))
+        ph_top = str(imagehash.phash(top_crop))
+
         return dict(
             file_path=file_path, md5=md5, sha256=sha256,
-            phash=ph, dhash=dh, ahash=ah,
+            phash=ph, dhash=dh, ahash=ah, phash_top=ph_top,
             file_size=len(data), width=w, height=h,
             computed_at=time.time(),
         )
@@ -98,15 +105,22 @@ class HashEngine:
             fp = str(f.path)
             if fp in cached_map:
                 c = cached_map[fp]
-                results.append(ImageHashes(
-                    file_path=fp, md5=c["md5"], sha256=c["sha256"],
-                    phash=c["phash"], dhash=c["dhash"], ahash=c["ahash"],
-                    file_size=f.file_size, width=c["width"], height=c["height"],
-                    computed_at=c["computed_at"],
-                ))
+                phash_top = c.get("phash_top", "")
+                if not phash_top:
+                    # Legacy cache entry without phash_top — force recompute
+                    to_compute.append(f)
+                    file_map[fp] = f
+                else:
+                    results.append(ImageHashes(
+                        file_path=fp, md5=c["md5"], sha256=c["sha256"],
+                        phash=c["phash"], dhash=c["dhash"], ahash=c["ahash"],
+                        phash_top=phash_top,
+                        file_size=f.file_size, width=c["width"], height=c["height"],
+                        computed_at=c["computed_at"],
+                    ))
             else:
                 to_compute.append(f)
-                file_map[str(f.path)] = f
+                file_map[fp] = f
 
         if progress_callback:
             progress_callback(len(results), total)
@@ -178,21 +192,32 @@ class HashEngine:
         # Find similar pairs using pairwise comparison
         # For 10K images this is ~50M comparisons on 64-bit ints — fast enough
         groups: list[DuplicateGroup] = []
-        used: set[int] = set()
         gid = 0
 
-        # Build adjacency
+        # Build adjacency — combine full-image hash + top-region hash
         n = len(items)
         adj: dict[int, set[int]] = defaultdict(set)
+        pair_dist: dict[tuple[int, int], float] = {}
+
+        top_items: list[tuple[int, ImageHashes]] = []
+        for h in hashes:
+            top_hash = h.phash_top if h.phash_top else h.phash
+            top_items.append((int(top_hash, 16), h))
+
         for i in range(n):
             for j in range(i + 1, n):
-                dist = bin(items[i][0] ^ items[j][0]).count("1")
-                if dist <= threshold:
+                dist_full = bin(items[i][0] ^ items[j][0]).count("1")
+                if dist_full <= threshold:
                     pa, pb = items[i][1].file_path, items[j][1].file_path
                     pair = tuple(sorted([pa, pb]))
                     if pair not in exact_pairs:
+                        # Blend: 80% full-image distance + 20% top-region distance
+                        # If phash_top is empty/same as phash, blending has no effect
+                        dist_top = bin(top_items[i][0] ^ top_items[j][0]).count("1")
+                        blended = dist_full * 0.8 + dist_top * 0.2
                         adj[i].add(j)
                         adj[j].add(i)
+                        pair_dist[(i, j)] = blended
 
         # Connected components via BFS
         visited: set[int] = set()
@@ -212,19 +237,34 @@ class HashEngine:
                         queue.append(nb)
             if len(component) >= 2:
                 gid += 1
-                # Compute average similarity within group
-                total_dist = 0
+                total_dist = 0.0
+                total_dist_full = 0.0
+                total_dist_top = 0.0
                 count = 0
                 for ci in range(len(component)):
                     for cj in range(ci + 1, len(component)):
-                        total_dist += bin(items[component[ci]][0] ^ items[component[cj]][0]).count("1")
+                        key = (min(component[ci], component[cj]), max(component[ci], component[cj]))
+                        total_dist += pair_dist.get(key, 0.0)
+                        # Track full-image and top-region distances separately
+                        i_idx, j_idx = component[ci], component[cj]
+                        dist_full = bin(items[i_idx][0] ^ items[j_idx][0]).count("1")
+                        dist_top = bin(top_items[i_idx][0] ^ top_items[j_idx][0]).count("1")
+                        total_dist_full += dist_full
+                        total_dist_top += dist_top
                         count += 1
                 avg_dist = total_dist / count if count else 0
+                avg_dist_full = total_dist_full / count if count else 0
+                avg_dist_top = total_dist_top / count if count else 0
                 similarity = max(0.0, 1.0 - avg_dist / 64.0)
+
+                # Multi-account detection: top region differs significantly more than body
+                is_multi_account = (avg_dist_top >= 2 and avg_dist_top > avg_dist_full * 1.5)
+
                 groups.append(DuplicateGroup(
                     group_id=gid, detection_method="perceptual",
                     similarity_score=round(similarity, 3),
                     files=[items[idx][1] for idx in component],
+                    multi_account=is_multi_account,
                 ))
 
         return groups

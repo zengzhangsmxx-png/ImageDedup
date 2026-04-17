@@ -69,6 +69,8 @@ class ResultsView(QWidget):
 
         for g in groups:
             method_label = _METHOD_LABELS.get(g.detection_method, g.detection_method)
+            if hasattr(g, 'multi_account') and g.multi_account:
+                method_label += " [一机多号截图]"
             sim_text = f"{g.similarity_score * 100:.1f}%"
 
             group_item = QTreeWidgetItem([
