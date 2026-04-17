@@ -2,11 +2,20 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QIcon, QPixmap
-from PyQt6.QtWidgets import QHeaderView, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import (
+    QHeaderView,
+    QMenu,
+    QMessageBox,
+    QTreeWidget,
+    QTreeWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
 
 from ..engine.hasher import DuplicateGroup
 
@@ -29,6 +38,7 @@ class ResultsView(QWidget):
     """Displays duplicate groups in a tree widget."""
 
     group_double_clicked = pyqtSignal(object)  # DuplicateGroup
+    file_double_clicked = pyqtSignal(str, object)  # (file_path, DuplicateGroup)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -47,6 +57,8 @@ class ResultsView(QWidget):
             header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
 
         self._tree.itemDoubleClicked.connect(self._on_double_click)
+        self._tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._tree.customContextMenuRequested.connect(self._on_context_menu)
         layout.addWidget(self._tree)
 
         self._groups: list[DuplicateGroup] = []
@@ -107,8 +119,67 @@ class ResultsView(QWidget):
 
     def _on_double_click(self, item: QTreeWidgetItem, column: int):
         group = item.data(0, Qt.ItemDataRole.UserRole)
-        if group and isinstance(group, DuplicateGroup) and len(group.files) >= 2:
-            self.group_double_clicked.emit(group)
+        if not group or not isinstance(group, DuplicateGroup):
+            return
+        if item.parent() is None:
+            if len(group.files) >= 2:
+                self.group_double_clicked.emit(group)
+        else:
+            file_path = item.toolTip(0)
+            if file_path:
+                self.file_double_clicked.emit(file_path, group)
+
+    def _on_context_menu(self, pos):
+        item = self._tree.itemAt(pos)
+        if item is None or item.parent() is None:
+            return
+
+        menu = QMenu(self)
+        action_remove = menu.addAction("从结果中移除")
+        action_delete = menu.addAction("删除文件（不可恢复）")
+
+        chosen = menu.exec(self._tree.viewport().mapToGlobal(pos))
+        if chosen == action_remove:
+            self._sync_group_data(item)
+            self._remove_item_from_tree(item)
+        elif chosen == action_delete:
+            self._delete_file_from_disk(item)
+
+    def _sync_group_data(self, item: QTreeWidgetItem):
+        file_path = item.toolTip(0)
+        group = item.data(0, Qt.ItemDataRole.UserRole)
+        if group and isinstance(group, DuplicateGroup):
+            group.files = [f for f in group.files if f.file_path != file_path]
+            if len(group.files) < 2:
+                self._groups = [g for g in self._groups if g.group_id != group.group_id]
+
+    def _remove_item_from_tree(self, item: QTreeWidgetItem):
+        parent = item.parent()
+        if parent is None:
+            return
+        parent.removeChild(item)
+        if parent.childCount() < 2:
+            index = self._tree.indexOfTopLevelItem(parent)
+            if index >= 0:
+                self._tree.takeTopLevelItem(index)
+
+    def _delete_file_from_disk(self, item: QTreeWidgetItem):
+        file_path = item.toolTip(0)
+        if not file_path:
+            return
+        reply = QMessageBox.warning(
+            self, "确认删除",
+            f"确定要永久删除此文件吗？\n\n{file_path}\n\n此操作不可恢复！",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            try:
+                os.remove(file_path)
+                self._sync_group_data(item)
+                self._remove_item_from_tree(item)
+            except OSError as e:
+                QMessageBox.critical(self, "删除失败", f"无法删除文件:\n{e}")
 
     @property
     def groups(self) -> list[DuplicateGroup]:

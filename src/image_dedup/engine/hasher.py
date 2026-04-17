@@ -6,7 +6,7 @@ import hashlib
 import os
 import time
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -83,20 +83,30 @@ class HashEngine:
         to_compute: list[ImageFile] = []
         total = len(files)
 
-        # Check cache first
+        # Batch cache lookup
+        keys = []
+        mtime_map: dict[str, float] = {}
         for f in files:
             fp = str(f.path)
-            mtime = f.path.stat().st_mtime
-            cached = self._cache.get(fp, f.file_size, mtime)
-            if cached:
+            mt = f.path.stat().st_mtime
+            keys.append((fp, f.file_size, mt))
+            mtime_map[fp] = mt
+
+        cached_map = self._cache.get_batch(keys)
+        file_map: dict[str, ImageFile] = {}
+        for f in files:
+            fp = str(f.path)
+            if fp in cached_map:
+                c = cached_map[fp]
                 results.append(ImageHashes(
-                    file_path=fp, md5=cached["md5"], sha256=cached["sha256"],
-                    phash=cached["phash"], dhash=cached["dhash"], ahash=cached["ahash"],
-                    file_size=f.file_size, width=cached["width"], height=cached["height"],
-                    computed_at=cached["computed_at"],
+                    file_path=fp, md5=c["md5"], sha256=c["sha256"],
+                    phash=c["phash"], dhash=c["dhash"], ahash=c["ahash"],
+                    file_size=f.file_size, width=c["width"], height=c["height"],
+                    computed_at=c["computed_at"],
                 ))
             else:
                 to_compute.append(f)
+                file_map[str(f.path)] = f
 
         if progress_callback:
             progress_callback(len(results), total)
@@ -104,21 +114,17 @@ class HashEngine:
         if not to_compute:
             return results
 
-        # Parallel hash computation
+        # Parallel hash computation with chunksize
         batch_for_cache: list[tuple[str, int, float, dict]] = []
+        paths = [str(f.path) for f in to_compute]
+        chunksize = max(1, len(paths) // (self._max_workers * 4))
         with ProcessPoolExecutor(max_workers=self._max_workers) as pool:
-            future_map = {
-                pool.submit(_compute_single, str(f.path)): f
-                for f in to_compute
-            }
-            for future in as_completed(future_map):
-                f = future_map[future]
-                h = future.result()
+            for h in pool.map(_compute_single, paths, chunksize=chunksize):
                 if h is not None:
                     ih = ImageHashes(**h)
                     results.append(ih)
-                    mtime = f.path.stat().st_mtime
-                    batch_for_cache.append((str(f.path), f.file_size, mtime, h))
+                    f = file_map[h["file_path"]]
+                    batch_for_cache.append((h["file_path"], f.file_size, mtime_map[h["file_path"]], h))
                 if progress_callback:
                     progress_callback(len(results), total)
 

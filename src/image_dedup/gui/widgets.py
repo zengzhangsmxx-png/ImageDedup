@@ -1,12 +1,14 @@
-"""Custom widgets — ImageViewer, ThresholdSlider, ThumbnailDelegate."""
+"""Custom widgets — ImageViewer, ThresholdSlider, DropListWidget."""
 
 from __future__ import annotations
+
+from pathlib import Path
 
 import cv2
 import numpy as np
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap
-from PyQt6.QtWidgets import QHBoxLayout, QLabel, QSlider, QWidget
+from PyQt6.QtWidgets import QHBoxLayout, QLabel, QListWidget, QSlider, QWidget
 
 
 def numpy_to_qpixmap(arr: np.ndarray) -> QPixmap:
@@ -92,3 +94,42 @@ class ThresholdSlider(QWidget):
 
     def value(self) -> int:
         return self._slider.value()
+
+
+class DropListWidget(QListWidget):
+    """QListWidget that accepts file/folder drag-and-drop."""
+
+    ACCEPTED_EXTENSIONS = {
+        ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".tif",
+        ".zip", ".xlsx", ".xls", ".pdf",
+    }
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self.setDragDropMode(QListWidget.DragDropMode.DropOnly)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        if not event.mimeData().hasUrls():
+            event.ignore()
+            return
+        for url in event.mimeData().urls():
+            local = url.toLocalFile()
+            if not local:
+                continue
+            p = Path(local)
+            if p.is_dir() or (p.is_file() and p.suffix.lower() in self.ACCEPTED_EXTENSIONS):
+                self.addItem(local)
+        event.acceptProposedAction()

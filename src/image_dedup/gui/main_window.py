@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
-from pathlib import Path
 
 from PyQt6.QtCore import QObject, QThread, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
@@ -13,7 +11,6 @@ from PyQt6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
-    QListWidget,
     QMainWindow,
     QMessageBox,
     QProgressBar,
@@ -29,8 +26,9 @@ from ..engine.feature import FeatureMatcher
 from ..engine.hasher import DuplicateGroup, HashEngine
 from ..engine.scanner import Scanner
 from .forensic_dialog import ForensicDialog
+from .image_viewer_dialog import ImageViewerDialog
 from .results_view import ResultsView
-from .widgets import ThresholdSlider
+from .widgets import DropListWidget, ThresholdSlider
 
 
 @dataclass
@@ -45,7 +43,7 @@ class ScanWorker(QObject):
     """Runs the full scan pipeline in a background thread."""
 
     progress = pyqtSignal(str, int, int)  # stage, current, total
-    finished = pyqtSignal(list)  # list[DuplicateGroup]
+    finished = pyqtSignal(list, object)  # list[DuplicateGroup], Scanner
     error = pyqtSignal(str)
 
     def __init__(self, sources: list[str], options: ScanOptions):
@@ -61,51 +59,81 @@ class ScanWorker(QObject):
             self.progress.emit("扫描文件...", 0, 0)
             files = scanner.scan(self._sources)
             if not files:
-                self.finished.emit([])
+                scanner.cleanup()
+                self.finished.emit([], scanner)
                 return
 
-            self.progress.emit("计算哈希...", 0, len(files))
-            hasher = HashEngine(cache)
-            hashes = hasher.compute_hashes(
-                files,
-                progress_callback=lambda cur, tot: self.progress.emit("计算哈希...", cur, tot),
-            )
+            # Partition by source_group: None = global pool, else per-document
+            global_files: list = []
+            doc_groups: dict[str, list] = {}
+            for f in files:
+                if f.source_group is None:
+                    global_files.append(f)
+                else:
+                    doc_groups.setdefault(f.source_group, []).append(f)
 
             all_groups: list[DuplicateGroup] = []
+            gid_offset = 0
 
-            if self._options.exact_match:
-                self.progress.emit("精准匹配...", 0, 0)
-                exact = hasher.find_exact_duplicates(hashes)
-                all_groups.extend(exact)
+            # Process global pool
+            if global_files:
+                groups = self._run_dedup(global_files, cache, gid_offset)
+                all_groups.extend(groups)
+                gid_offset = max((g.group_id for g in all_groups), default=0)
 
-            if self._options.perceptual:
-                self.progress.emit("感知哈希比较...", 0, 0)
-                perceptual = hasher.find_perceptual_duplicates(
-                    hashes, threshold=self._options.perceptual_threshold,
-                )
-                # Re-number group IDs to avoid collision
-                offset = max((g.group_id for g in all_groups), default=0)
-                for g in perceptual:
-                    g.group_id += offset
-                all_groups.extend(perceptual)
+            # Process each document independently
+            for doc_path, doc_files in doc_groups.items():
+                if len(doc_files) < 2:
+                    continue
+                groups = self._run_dedup(doc_files, cache, gid_offset)
+                all_groups.extend(groups)
+                gid_offset = max((g.group_id for g in all_groups), default=0)
 
-            if self._options.feature_match:
-                self.progress.emit("ORB 特征匹配...", 0, 0)
-                matcher = FeatureMatcher()
-                feature_groups = matcher.compare_candidates(
-                    hashes,
-                    min_score=0.15,
-                    progress_callback=lambda cur, tot: self.progress.emit("ORB 特征匹配...", cur, tot),
-                )
-                offset = max((g.group_id for g in all_groups), default=0)
-                for g in feature_groups:
-                    g.group_id += offset
-                all_groups.extend(feature_groups)
-
-            scanner.cleanup()
-            self.finished.emit(all_groups)
+            # Don't cleanup — MainWindow holds scanner alive until next scan / close
+            self.finished.emit(all_groups, scanner)
         except Exception as e:
             self.error.emit(str(e))
+
+    def _run_dedup(self, files, cache, gid_offset) -> list[DuplicateGroup]:
+        hasher = HashEngine(cache)
+        hashes = hasher.compute_hashes(
+            files,
+            progress_callback=lambda cur, tot: self.progress.emit("计算哈希...", cur, tot),
+        )
+
+        groups: list[DuplicateGroup] = []
+
+        if self._options.exact_match:
+            self.progress.emit("精准匹配...", 0, 0)
+            exact = hasher.find_exact_duplicates(hashes)
+            for g in exact:
+                g.group_id += gid_offset
+            groups.extend(exact)
+
+        if self._options.perceptual:
+            self.progress.emit("感知哈希比较...", 0, 0)
+            perceptual = hasher.find_perceptual_duplicates(
+                hashes, threshold=self._options.perceptual_threshold,
+            )
+            offset = max((g.group_id for g in groups), default=gid_offset)
+            for g in perceptual:
+                g.group_id += offset
+            groups.extend(perceptual)
+
+        if self._options.feature_match:
+            self.progress.emit("ORB 特征匹配...", 0, 0)
+            matcher = FeatureMatcher()
+            feature_groups = matcher.compare_candidates(
+                hashes,
+                min_score=0.15,
+                progress_callback=lambda cur, tot: self.progress.emit("ORB 特征匹配...", cur, tot),
+            )
+            offset = max((g.group_id for g in groups), default=gid_offset)
+            for g in feature_groups:
+                g.group_id += offset
+            groups.extend(feature_groups)
+
+        return groups
 
 
 class MainWindow(QMainWindow):
@@ -117,6 +145,7 @@ class MainWindow(QMainWindow):
         self._thread: QThread | None = None
         self._worker: ScanWorker | None = None
         self._groups: list[DuplicateGroup] = []
+        self._scanner: Scanner | None = None  # Keep scanner alive for temp files
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -145,7 +174,7 @@ class MainWindow(QMainWindow):
 
         # Source list
         layout.addWidget(QLabel("图片来源:"))
-        self._source_list = QListWidget()
+        self._source_list = DropListWidget()
         self._source_list.setMinimumWidth(250)
         layout.addWidget(self._source_list, 1)
 
@@ -202,6 +231,7 @@ class MainWindow(QMainWindow):
     def _build_right_panel(self) -> QWidget:
         self._results_view = ResultsView()
         self._results_view.group_double_clicked.connect(self._on_group_double_clicked)
+        self._results_view.file_double_clicked.connect(self._on_file_double_clicked)
         return self._results_view
 
     # --- Source management ---
@@ -214,7 +244,8 @@ class MainWindow(QMainWindow):
     def _add_files(self):
         paths, _ = QFileDialog.getOpenFileNames(
             self, "选择图片文件", "",
-            "图片文件 (*.jpg *.jpeg *.png *.gif *.bmp *.webp *.tiff *.tif);;所有文件 (*)",
+            "图片文件 (*.jpg *.jpeg *.png *.gif *.bmp *.webp *.tiff *.tif);;"
+            "文档文件 (*.xlsx *.xls *.pdf);;所有文件 (*)",
         )
         for p in paths:
             self._source_list.addItem(p)
@@ -256,7 +287,7 @@ class MainWindow(QMainWindow):
         self._worker.progress.connect(self._on_progress)
         self._worker.finished.connect(self._on_scan_finished)
         self._worker.error.connect(self._on_scan_error)
-        self._worker.finished.connect(self._thread.quit)
+        self._worker.finished.connect(lambda *_: self._thread.quit())
         self._worker.error.connect(self._thread.quit)
         self._thread.start()
 
@@ -275,7 +306,12 @@ class MainWindow(QMainWindow):
         else:
             self._progress_bar.setRange(0, 0)
 
-    def _on_scan_finished(self, groups: list[DuplicateGroup]):
+    def _on_scan_finished(self, groups: list[DuplicateGroup], scanner: Scanner):
+        # Clean up previous scanner's temp files, keep new one alive
+        if self._scanner is not None:
+            self._scanner.cleanup()
+        self._scanner = scanner
+
         self._groups = groups
         self._set_scanning(False)
         self._results_view.set_results(groups)
@@ -297,6 +333,16 @@ class MainWindow(QMainWindow):
     def _on_group_double_clicked(self, group: DuplicateGroup):
         dlg = ForensicDialog(group, self)
         dlg.exec()
+
+    def _on_file_double_clicked(self, file_path: str, group: DuplicateGroup):
+        dlg = ImageViewerDialog(file_path, group, self)
+        dlg.exec()
+
+    def closeEvent(self, event):
+        if self._scanner is not None:
+            self._scanner.cleanup()
+            self._scanner = None
+        super().closeEvent(event)
 
     # --- Report ---
 

@@ -1,13 +1,14 @@
-"""File discovery — walks directories, extracts ZIP archives."""
+"""File discovery — walks directories, extracts ZIP/Excel/PDF archives."""
 
 from __future__ import annotations
 
 import tempfile
 import zipfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 SUPPORTED_FORMATS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".tif"}
+DOCUMENT_FORMATS = {".xlsx", ".xls", ".pdf"}
 
 
 @dataclass
@@ -16,7 +17,8 @@ class ImageFile:
     original_path: Path
     file_size: int
     format: str
-    source_type: str  # "folder", "file", "archive"
+    source_type: str  # "folder", "file", "archive", "document"
+    source_group: str | None = None
 
 
 class Scanner:
@@ -31,16 +33,19 @@ class Scanner:
             if p.is_dir():
                 results.extend(self._walk_directory(p, seen))
             elif p.is_file():
-                if p.suffix.lower() in (".zip",):
+                suffix = p.suffix.lower()
+                if suffix in (".zip",):
                     results.extend(self._extract_archive(p, seen))
-                elif p.suffix.lower() in SUPPORTED_FORMATS:
+                elif suffix in DOCUMENT_FORMATS:
+                    results.extend(self._extract_document(p, seen))
+                elif suffix in SUPPORTED_FORMATS:
                     rp = str(p.resolve())
                     if rp not in seen:
                         seen.add(rp)
                         results.append(ImageFile(
                             path=p.resolve(), original_path=p,
                             file_size=p.stat().st_size,
-                            format=p.suffix.lower().lstrip("."),
+                            format=suffix.lstrip("."),
                             source_type="file",
                         ))
         return results
@@ -80,6 +85,83 @@ class Scanner:
                             source_type="archive",
                         ))
         except zipfile.BadZipFile:
+            pass
+        return results
+
+    def _extract_document(self, doc_path: Path, seen: set[str]) -> list[ImageFile]:
+        suffix = doc_path.suffix.lower()
+        if suffix in (".xlsx", ".xls"):
+            return self._extract_xlsx(doc_path, seen)
+        elif suffix == ".pdf":
+            return self._extract_pdf(doc_path, seen)
+        return []
+
+    def _extract_xlsx(self, doc_path: Path, seen: set[str]) -> list[ImageFile]:
+        results = []
+        td = tempfile.TemporaryDirectory(prefix="imgdedup_xlsx_")
+        self._temp_dirs.append(td)
+        try:
+            from openpyxl import load_workbook
+            wb = load_workbook(str(doc_path), data_only=True)
+            img_idx = 0
+            for ws in wb.worksheets:
+                for img in ws._images:
+                    img_idx += 1
+                    ext = getattr(img, "format", "png") or "png"
+                    out_path = Path(td.name) / f"img_{img_idx}.{ext}"
+                    data = img._data()
+                    if not data:
+                        continue
+                    out_path.write_bytes(data)
+                    rp = str(out_path.resolve())
+                    if rp not in seen:
+                        seen.add(rp)
+                        results.append(ImageFile(
+                            path=out_path.resolve(),
+                            original_path=doc_path / f"img_{img_idx}.{ext}",
+                            file_size=out_path.stat().st_size,
+                            format=ext,
+                            source_type="document",
+                            source_group=str(doc_path),
+                        ))
+            wb.close()
+        except Exception:
+            pass
+        return results
+
+    def _extract_pdf(self, doc_path: Path, seen: set[str]) -> list[ImageFile]:
+        results = []
+        td = tempfile.TemporaryDirectory(prefix="imgdedup_pdf_")
+        self._temp_dirs.append(td)
+        try:
+            import fitz
+            doc = fitz.open(str(doc_path))
+            img_idx = 0
+            for page_idx in range(len(doc)):
+                for img_info in doc.get_page_images(page_idx, full=True):
+                    xref = img_info[0]
+                    try:
+                        pix = fitz.Pixmap(doc, xref)
+                        if pix.n > 4:
+                            pix = fitz.Pixmap(fitz.csRGB, pix)
+                        img_idx += 1
+                        out_path = Path(td.name) / f"page{page_idx + 1}_img{img_idx}.png"
+                        pix.save(str(out_path))
+                        rp = str(out_path.resolve())
+                        if rp not in seen:
+                            seen.add(rp)
+                            results.append(ImageFile(
+                                path=out_path.resolve(),
+                                original_path=doc_path / f"page{page_idx + 1}_img{img_idx}.png",
+                                file_size=out_path.stat().st_size,
+                                format="png",
+                                source_type="document",
+                                source_group=str(doc_path),
+                            ))
+                    except Exception:
+                        continue
+            doc.close()
+        except Exception:
             pass
         return results
 

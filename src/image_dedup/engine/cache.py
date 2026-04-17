@@ -43,6 +43,7 @@ class HashCache:
             conn = sqlite3.connect(self._db_path)
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA busy_timeout=5000")
             self._local.conn = conn
         return conn
 
@@ -89,6 +90,30 @@ class HashCache:
             ],
         )
         conn.commit()
+
+    def get_batch(self, keys: list[tuple[str, int, float]]) -> dict[str, dict]:
+        if not keys:
+            return {}
+        conn = self._conn()
+        results = {}
+        chunk_size = 300
+        for i in range(0, len(keys), chunk_size):
+            chunk = keys[i:i + chunk_size]
+            placeholders = ",".join(["(?,?,?)"] * len(chunk))
+            params: list = []
+            for fp, fs, mt in chunk:
+                params.extend([fp, fs, mt])
+            rows = conn.execute(
+                "SELECT file_path, md5, sha256, phash, dhash, ahash, width, height, computed_at "
+                f"FROM hash_cache WHERE (file_path, file_size, mtime) IN ({placeholders})",
+                params,
+            ).fetchall()
+            for row in rows:
+                results[row[0]] = dict(
+                    md5=row[1], sha256=row[2], phash=row[3], dhash=row[4],
+                    ahash=row[5], width=row[6], height=row[7], computed_at=row[8],
+                )
+        return results
 
     def clear(self):
         self._conn().execute("DELETE FROM hash_cache")

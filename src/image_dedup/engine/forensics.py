@@ -51,6 +51,18 @@ class LightingAnalysis:
     edges_b: np.ndarray
 
 
+@dataclass
+class SingleNoiseResult:
+    noise_image: np.ndarray
+    noise_level: float
+
+
+@dataclass
+class SingleLightingResult:
+    histogram: np.ndarray
+    edges: np.ndarray
+
+
 def _extract_exif(path: str) -> dict[str, str]:
     """Extract key EXIF fields from an image."""
     meta: dict[str, str] = {}
@@ -214,3 +226,31 @@ class ForensicAnalyzer:
             histogram_correlation=round(corr, 4),
             edges_a=edges_a, edges_b=edges_b,
         )
+
+    def single_noise_analysis(self, path: str, sigma: float = 3.0) -> SingleNoiseResult | None:
+        img = _load_cv2_rgb(path)
+        if img is None:
+            return None
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        noise = gray - gaussian_filter(gray, sigma=sigma)
+
+        mn, mx = noise.min(), noise.max()
+        if mx - mn < 1e-6:
+            normalized = np.zeros_like(noise, dtype=np.uint8)
+        else:
+            normalized = ((noise - mn) / (mx - mn) * 255).astype(np.uint8)
+
+        return SingleNoiseResult(
+            noise_image=normalized,
+            noise_level=round(float(np.std(noise)), 2),
+        )
+
+    def single_lighting_analysis(self, path: str) -> SingleLightingResult | None:
+        img = _load_cv2_rgb(path)
+        if img is None:
+            return None
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        hist = cv2.calcHist([gray], [0], None, [256], [0, 256]).flatten()
+        hist = hist / (hist.sum() + 1e-8)
+        edges = cv2.Canny(gray, 50, 150)
+        return SingleLightingResult(histogram=hist, edges=edges)
