@@ -60,6 +60,17 @@ CREATE TABLE IF NOT EXISTS scan_progress (
     total_files   INTEGER NOT NULL DEFAULT 0,
     status        TEXT NOT NULL DEFAULT 'running'
 );
+
+CREATE TABLE IF NOT EXISTS archive_scan_results (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    archive_path   TEXT NOT NULL,
+    scan_date      TEXT NOT NULL,
+    total_files    INTEGER DEFAULT 0,
+    duplicate_groups INTEGER DEFAULT 0,
+    high_sim_pct   REAL DEFAULT 0.0,
+    created_at     REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_archive_scan_date ON archive_scan_results(scan_date);
 """
 
 

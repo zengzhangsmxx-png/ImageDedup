@@ -21,6 +21,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QSplitter,
     QStatusBar,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -32,6 +33,7 @@ from ..engine.feature import FeatureMatcher
 from ..engine.hasher import DuplicateGroup, HashEngine
 from ..engine.scanner import Scanner
 from ..logging_setup import get_logger
+from .archive_scan_tab import ArchiveScanTab
 from .forensic_dialog import ForensicDialog
 from .image_viewer_dialog import ImageViewerDialog
 from .results_view import ResultsView
@@ -285,17 +287,34 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         main_layout = QVBoxLayout(central)
 
+        # Tab widget
+        self._tabs = QTabWidget()
+        main_layout.addWidget(self._tabs, 1)
+
+        # Tab 1: 图片查重
+        image_tab = QWidget()
+        image_layout = QVBoxLayout(image_tab)
+        image_layout.setContentsMargins(0, 0, 0, 0)
+
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self._build_left_panel())
         splitter.addWidget(self._build_right_panel())
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 3)
-        main_layout.addWidget(splitter, 1)
+        image_layout.addWidget(splitter, 1)
 
-        # Progress bar
+        # Progress bar (inside image tab)
         self._progress_bar = QProgressBar()
         self._progress_bar.setVisible(False)
-        main_layout.addWidget(self._progress_bar)
+        image_layout.addWidget(self._progress_bar)
+
+        self._tabs.addTab(image_tab, "图片查重")
+
+        # Tab 2: 压缩包扫描
+        self._archive_tab = ArchiveScanTab(config=self._config)
+        self._archive_tab.group_double_clicked.connect(self._on_group_double_clicked)
+        self._archive_tab.file_double_clicked.connect(self._on_file_double_clicked)
+        self._tabs.addTab(self._archive_tab, "压缩包扫描")
 
         # Status bar
         self._status = QStatusBar()

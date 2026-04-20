@@ -76,6 +76,10 @@ class AppConfig:
     # Extract location
     extract_to_archive_dir: bool = True
 
+    # Archive scan
+    archive_cache_cleanup_days: int = 7
+    archive_scan_work_dir: str = ""
+
     # System settings
     log_level: str = "INFO"
 
