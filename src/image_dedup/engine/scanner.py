@@ -11,7 +11,23 @@ from ..logging_setup import get_logger
 
 logger = get_logger("scanner")
 
-SUPPORTED_FORMATS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".tif"}
+# Register HEIC/AVIF openers at module level
+try:
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+except ImportError:
+    pass
+
+try:
+    import pillow_avif
+except ImportError:
+    pass
+
+# Format constants
+VIDEO_FORMATS = {".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".webm"}
+HEIC_FORMATS = {".heic", ".heif"}
+AVIF_FORMATS = {".avif"}
+SUPPORTED_FORMATS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".tif"} | HEIC_FORMATS | AVIF_FORMATS
 DOCUMENT_FORMATS = {".xlsx", ".xls", ".pdf"}
 
 
@@ -54,6 +70,54 @@ class Scanner:
                         ))
         return results
 
+    def scan_all(self, paths: list[str | Path], errors=None) -> tuple[list[ImageFile], list]:
+        """
+        Scan for both images and videos.
+
+        Returns:
+            tuple of (image_files, video_files)
+        """
+        from .video import VideoFile
+
+        image_results = self.scan(paths, errors)
+        video_results: list[VideoFile] = []
+        seen: set[str] = set()
+
+        for p in paths:
+            p = Path(p)
+            if p.is_dir():
+                video_results.extend(self._walk_directory_videos(p, seen))
+            elif p.is_file():
+                suffix = p.suffix.lower()
+                if suffix in VIDEO_FORMATS:
+                    rp = str(p.resolve())
+                    if rp not in seen:
+                        seen.add(rp)
+                        try:
+                            import cv2
+                            cap = cv2.VideoCapture(str(p))
+                            duration = 0.0
+                            keyframe_count = 0
+                            if cap.isOpened():
+                                fps = cap.get(cv2.CAP_PROP_FPS)
+                                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                                duration = total_frames / fps if fps > 0 else 0
+                                keyframe_count = int(total_frames / (fps * 2)) if fps > 0 else 0
+                                cap.release()
+
+                            video_results.append(VideoFile(
+                                path=str(p.resolve()),
+                                original_path=str(p),
+                                file_size=p.stat().st_size,
+                                duration=duration,
+                                keyframe_count=keyframe_count,
+                                source_type="file",
+                            ))
+                        except Exception as e:
+                            logger.warning(f"Failed to read video metadata {p}: {e}")
+
+        return image_results, video_results
+
     def _walk_directory(self, directory: Path, seen: set[str]) -> list[ImageFile]:
         results = []
         for f in sorted(directory.rglob("*")):
@@ -67,6 +131,40 @@ class Scanner:
                         format=f.suffix.lower().lstrip("."),
                         source_type="folder",
                     ))
+        return results
+
+    def _walk_directory_videos(self, directory: Path, seen: set[str]) -> list:
+        """Walk directory and collect video files."""
+        from .video import VideoFile
+
+        results = []
+        for f in sorted(directory.rglob("*")):
+            if f.is_file() and f.suffix.lower() in VIDEO_FORMATS:
+                rp = str(f.resolve())
+                if rp not in seen:
+                    seen.add(rp)
+                    try:
+                        import cv2
+                        cap = cv2.VideoCapture(str(f))
+                        duration = 0.0
+                        keyframe_count = 0
+                        if cap.isOpened():
+                            fps = cap.get(cv2.CAP_PROP_FPS)
+                            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                            duration = total_frames / fps if fps > 0 else 0
+                            keyframe_count = int(total_frames / (fps * 2)) if fps > 0 else 0
+                            cap.release()
+
+                        results.append(VideoFile(
+                            path=str(f.resolve()),
+                            original_path=str(f),
+                            file_size=f.stat().st_size,
+                            duration=duration,
+                            keyframe_count=keyframe_count,
+                            source_type="folder",
+                        ))
+                    except Exception as e:
+                        logger.warning(f"Failed to read video metadata {f}: {e}")
         return results
 
     def _extract_archive(self, archive_path: Path, seen: set[str], errors=None) -> list[ImageFile]:

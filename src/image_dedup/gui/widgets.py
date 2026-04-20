@@ -8,7 +8,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal, QThread
 from PyQt6.QtGui import QImage, QPixmap
 from PyQt6.QtWidgets import (
     QHBoxLayout,
@@ -113,6 +113,8 @@ class ThresholdSlider(QWidget):
 ARCHIVE_EXTENSIONS = {".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".tgz", ".tar.gz", ".tar.bz2"}
 ACCEPTED_EXTENSIONS = {
     ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".tif",
+    ".heic", ".heif", ".avif",
+    ".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".webm",
     ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".tgz",
     ".xlsx", ".xls", ".pdf",
 }
@@ -196,10 +198,35 @@ def _recursive_extract(archive_path: Path, dest_dir: Path):
                 pass
 
 
+class ExtractionWorker(QThread):
+    """Worker thread for archive extraction."""
+    progress = pyqtSignal(int)
+    finished = pyqtSignal(Path)
+    error = pyqtSignal(str)
+
+    def __init__(self, archive_path: Path, dest_dir: Path):
+        super().__init__()
+        self.archive_path = archive_path
+        self.dest_dir = dest_dir
+        self._cancelled = False
+
+    def run(self):
+        try:
+            _recursive_extract(self.archive_path, self.dest_dir)
+            if not self._cancelled:
+                self.finished.emit(self.dest_dir)
+        except Exception as e:
+            if not self._cancelled:
+                self.error.emit(str(e))
+
+    def cancel(self):
+        self._cancelled = True
+
+
 class DropTreeWidget(QTreeWidget):
     """Tree widget for source management with drag-drop, auto-expand folders and auto-extract archives."""
 
-    def __init__(self, parent=None):
+    def __init__(self, config=None, parent=None):
         super().__init__(parent)
         self.setHeaderLabels(["来源", "类型", "数量"])
         self.setColumnCount(3)
@@ -212,6 +239,7 @@ class DropTreeWidget(QTreeWidget):
         self.setRootIsDecorated(True)
         self.setAlternatingRowColors(True)
         self._extracted_dirs: list[Path] = []
+        self._config = config
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
@@ -253,7 +281,8 @@ class DropTreeWidget(QTreeWidget):
         sub_dirs = sorted([d for d in folder.iterdir() if d.is_dir()])
         img_count = sum(1 for f in folder.iterdir()
                         if f.is_file() and f.suffix.lower() in {
-                            ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".tif"})
+                            ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".tif",
+                            ".heic", ".heif", ".avif"})
 
         if sub_dirs:
             for sd in sub_dirs:
@@ -265,7 +294,8 @@ class DropTreeWidget(QTreeWidget):
     def _add_subfolder(self, parent_item: QTreeWidgetItem, folder: Path):
         img_count = sum(1 for f in folder.rglob("*")
                         if f.is_file() and f.suffix.lower() in {
-                            ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".tif"})
+                            ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".tif",
+                            ".heic", ".heif", ".avif"})
         child = QTreeWidgetItem([folder.name, "子文件夹", f"{img_count} 张" if img_count else ""])
         child.setToolTip(0, str(folder))
         child.setData(0, Qt.ItemDataRole.UserRole, str(folder))
@@ -278,29 +308,64 @@ class DropTreeWidget(QTreeWidget):
         parent_item.addChild(child)
 
     def add_archive(self, archive_path: Path):
-        """Extract archive to app cache directory, preserving folder hierarchy with level labels."""
-        _EXTRACT_BASE.mkdir(parents=True, exist_ok=True)
-        dest_dir = _EXTRACT_BASE / archive_path.stem
-        # Avoid collision if same name already extracted
-        if dest_dir.exists():
-            idx = 1
-            while (dest_dir.parent / f"{archive_path.stem}_{idx}").exists():
-                idx += 1
-            dest_dir = dest_dir.parent / f"{archive_path.stem}_{idx}"
+        """Extract archive with progress dialog, then add to tree."""
+        from .comparison_widget import ExtractionProgressDialog
 
-        _recursive_extract(archive_path, dest_dir)
-        self._extracted_dirs.append(dest_dir)
+        # Determine extraction directory
+        if self._config and self._config.extract_to_archive_dir:
+            dest_dir = archive_path.parent / f"{archive_path.stem}_extracted"
+        else:
+            _EXTRACT_BASE.mkdir(parents=True, exist_ok=True)
+            dest_dir = _EXTRACT_BASE / archive_path.stem
+            # Avoid collision if same name already extracted
+            if dest_dir.exists():
+                idx = 1
+                while (dest_dir.parent / f"{archive_path.stem}_{idx}").exists():
+                    idx += 1
+                dest_dir = dest_dir.parent / f"{archive_path.stem}_{idx}"
 
-        img_count = self._count_images(dest_dir)
-        item = QTreeWidgetItem([archive_path.name, "压缩包", f"{img_count} 张" if img_count else ""])
-        item.setToolTip(0, str(dest_dir))
-        item.setData(0, Qt.ItemDataRole.UserRole, str(dest_dir))
-        item.setCheckState(0, Qt.CheckState.Checked)
+        # Create progress dialog
+        progress_dialog = ExtractionProgressDialog(self)
+        progress_dialog.set_archive_name(archive_path.name)
 
-        self._add_archive_children(item, dest_dir, level=0)
+        # Create worker thread
+        worker = ExtractionWorker(archive_path, dest_dir)
 
-        self.addTopLevelItem(item)
-        item.setExpanded(True)
+        def on_finished(extracted_dir: Path):
+            progress_dialog.accept()
+            self._extracted_dirs.append(extracted_dir)
+
+            img_count = self._count_images(extracted_dir)
+            item = QTreeWidgetItem([archive_path.name, "压缩包", f"{img_count} 张" if img_count else ""])
+            item.setToolTip(0, str(extracted_dir))
+            item.setData(0, Qt.ItemDataRole.UserRole, str(extracted_dir))
+            item.setCheckState(0, Qt.CheckState.Checked)
+
+            self._add_archive_children(item, extracted_dir, level=0)
+
+            self.addTopLevelItem(item)
+            item.setExpanded(True)
+
+        def on_error(error_msg: str):
+            progress_dialog.reject()
+            logger.error(f"Extraction failed: {error_msg}")
+
+        def on_cancel():
+            worker.cancel()
+            worker.wait()
+            # Clean up partial extraction
+            if dest_dir.exists():
+                try:
+                    shutil.rmtree(dest_dir)
+                except Exception as e:
+                    logger.warning(f"Failed to clean up partial extraction: {e}")
+
+        worker.finished.connect(on_finished)
+        worker.error.connect(on_error)
+        progress_dialog.rejected.connect(on_cancel)
+
+        worker.start()
+        progress_dialog.exec()
 
     def add_file(self, file_path: Path):
         """Add a single file (image, xlsx, pdf)."""
@@ -313,7 +378,8 @@ class DropTreeWidget(QTreeWidget):
     def _count_images(self, folder: Path) -> int:
         return sum(1 for f in folder.rglob("*")
                    if f.is_file() and f.suffix.lower() in {
-                       ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".tif"})
+                       ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".tif",
+                       ".heic", ".heif", ".avif"})
 
     def get_checked_paths(self) -> list[str]:
         """Return all checked source paths (for scanning)."""
@@ -355,7 +421,8 @@ class DropTreeWidget(QTreeWidget):
 
     def _add_archive_children(self, parent_item: QTreeWidgetItem, folder: Path, level: int):
         """Recursively add sub-folders with level labels (1级/2级/3级目录)."""
-        _IMG_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".tif"}
+        _IMG_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".tif",
+                     ".heic", ".heif", ".avif"}
         sub_dirs = sorted([d for d in folder.iterdir() if d.is_dir()])
         loose_imgs = [f for f in folder.iterdir()
                       if f.is_file() and f.suffix.lower() in _IMG_EXTS]

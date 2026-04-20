@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QIcon, QPixmap
 from PyQt6.QtWidgets import (
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFileDialog,
+    QFormLayout,
     QHeaderView,
     QHBoxLayout,
     QLabel,
@@ -29,6 +34,8 @@ _METHOD_LABELS = {
     "exact": "精准匹配 (MD5)",
     "perceptual": "感知哈希",
     "feature": "特征匹配 (ORB)",
+    "video": "视频查重",
+    "semantic": "AI 语义相似度",
 }
 
 
@@ -38,6 +45,65 @@ def _human_size(size: int) -> str:
             return f"{size:.1f} {unit}"
         size /= 1024
     return f"{size:.1f} TB"
+
+
+class BatchRenameDialog(QDialog):
+    """批量重命名对话框：前缀 + 起始序号，实时预览。"""
+
+    def __init__(self, extensions: list[str], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("批量重命名")
+        self.setMinimumWidth(400)
+        self._extensions = extensions
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self._prefix = QLineEdit("img")
+        self._prefix.textChanged.connect(self._update_preview)
+        form.addRow("前缀:", self._prefix)
+
+        self._start = QSpinBox()
+        self._start.setRange(1, 999999)
+        self._start.setValue(1)
+        self._start.valueChanged.connect(self._update_preview)
+        form.addRow("起始序号:", self._start)
+
+        layout.addLayout(form)
+
+        self._preview = QLabel()
+        self._preview.setWordWrap(True)
+        self._preview.setStyleSheet("color: #666; padding: 6px;")
+        layout.addWidget(QLabel("预览:"))
+        layout.addWidget(self._preview)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self._update_preview()
+
+    def _update_preview(self):
+        prefix = self._prefix.text() or "img"
+        start = self._start.value()
+        samples = []
+        for i, ext in enumerate(self._extensions[:5]):
+            samples.append(f"{prefix}_{start + i:03d}{ext}")
+        text = ", ".join(samples)
+        if len(self._extensions) > 5:
+            text += f", ... (共 {len(self._extensions)} 个)"
+        self._preview.setText(text)
+
+    @property
+    def prefix(self) -> str:
+        return self._prefix.text() or "img"
+
+    @property
+    def start_index(self) -> int:
+        return self._start.value()
 
 
 class ResultsView(QWidget):
@@ -62,11 +128,26 @@ class ResultsView(QWidget):
         self._btn_batch_delete.clicked.connect(self._batch_delete_selected)
         self._btn_batch_delete.setStyleSheet("color: #d32f2f;")
 
+        self._btn_batch_move = QPushButton("批量移动")
+        self._btn_batch_move.setToolTip("将选中的文件移动到指定目录")
+        self._btn_batch_move.clicked.connect(self._batch_move_selected)
+
+        self._btn_auto_best = QPushButton("自动保留最优")
+        self._btn_auto_best.setToolTip("每组自动勾选副本，保留分辨率最高的文件")
+        self._btn_auto_best.clicked.connect(self._auto_keep_best)
+
+        self._btn_batch_rename = QPushButton("批量重命名")
+        self._btn_batch_rename.setToolTip("批量重命名选中的文件")
+        self._btn_batch_rename.clicked.connect(self._batch_rename_selected)
+
         self._btn_deselect = QPushButton("取消选择")
         self._btn_deselect.clicked.connect(lambda: self._tree.clearSelection())
 
         toolbar.addWidget(self._btn_select_dupes)
         toolbar.addWidget(self._btn_batch_delete)
+        toolbar.addWidget(self._btn_batch_move)
+        toolbar.addWidget(self._btn_auto_best)
+        toolbar.addWidget(self._btn_batch_rename)
         toolbar.addWidget(self._btn_deselect)
         toolbar.addStretch()
         layout.addLayout(toolbar)
@@ -81,7 +162,7 @@ class ResultsView(QWidget):
 
         filter_layout.addWidget(QLabel("方法:"))
         self._filter_method = QComboBox()
-        self._filter_method.addItems(["全部", "精准匹配", "感知哈希", "特征匹配"])
+        self._filter_method.addItems(["全部", "精准匹配", "感知哈希", "特征匹配", "视频查重", "AI 语义相似度"])
         self._filter_method.currentIndexChanged.connect(self._apply_filters)
         filter_layout.addWidget(self._filter_method)
 
@@ -341,6 +422,115 @@ class ResultsView(QWidget):
             msg += f"\n\n{len(failed)} 个文件删除失败:\n" + "\n".join(failed[:5])
         QMessageBox.information(self, "批量删除完成", msg)
 
+    def _batch_move_selected(self):
+        """Move all selected file items to a chosen directory."""
+        selected = self._tree.selectedItems()
+        file_items = [item for item in selected if item.parent() is not None]
+        if not file_items:
+            QMessageBox.information(self, "提示", "请先选择要移动的文件")
+            return
+
+        dest_dir = QFileDialog.getExistingDirectory(self, "选择目标目录")
+        if not dest_dir:
+            return
+
+        dest = Path(dest_dir)
+        moved = 0
+        failed = []
+        for item in reversed(file_items):
+            file_path = item.toolTip(0)
+            src = Path(file_path)
+            target = dest / src.name
+            # Handle name collisions
+            if target.exists():
+                stem = src.stem
+                suffix = src.suffix
+                counter = 1
+                while target.exists():
+                    target = dest / f"{stem}_{counter}{suffix}"
+                    counter += 1
+            try:
+                shutil.move(str(src), str(target))
+                self._sync_group_data(item)
+                self._remove_item_from_tree(item)
+                moved += 1
+            except OSError as e:
+                failed.append(f"{src.name}: {e}")
+
+        msg = f"已移动 {moved} 个文件到 {dest_dir}"
+        if failed:
+            msg += f"\n\n{len(failed)} 个文件移动失败:\n" + "\n".join(failed[:5])
+        QMessageBox.information(self, "批量移动完成", msg)
+
+    def _auto_keep_best(self):
+        """For each group, check all duplicates and uncheck the best file via checkboxes."""
+        marked = 0
+        for i in range(self._tree.topLevelItemCount()):
+            group_item = self._tree.topLevelItem(i)
+            group = group_item.data(0, Qt.ItemDataRole.UserRole)
+            if not isinstance(group, DuplicateGroup) or len(group.files) < 2:
+                continue
+            best = self._pick_best_in_group(group)
+            for j in range(group_item.childCount()):
+                child = group_item.child(j)
+                file_path = child.toolTip(0)
+                if file_path == best.file_path:
+                    child.setCheckState(0, Qt.CheckState.Unchecked)
+                else:
+                    child.setCheckState(0, Qt.CheckState.Checked)
+                    marked += 1
+
+        QMessageBox.information(self, "自动保留最优", f"已标记 {marked} 个副本文件")
+
+    def _batch_rename_selected(self):
+        """Rename all selected file items using a prefix + sequential number."""
+        selected = self._tree.selectedItems()
+        file_items = [item for item in selected if item.parent() is not None]
+        if not file_items:
+            QMessageBox.information(self, "提示", "请先选择要重命名的文件")
+            return
+
+        extensions = [Path(item.toolTip(0)).suffix for item in file_items]
+        dlg = BatchRenameDialog(extensions, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        prefix = dlg.prefix
+        start = dlg.start_index
+        renamed = 0
+        failed = []
+        for idx, item in enumerate(file_items):
+            file_path = item.toolTip(0)
+            src = Path(file_path)
+            new_name = f"{prefix}_{start + idx:03d}{src.suffix}"
+            target = src.parent / new_name
+            # Handle collision with existing file
+            if target.exists() and target != src:
+                counter = 1
+                stem = f"{prefix}_{start + idx:03d}"
+                while target.exists() and target != src:
+                    target = src.parent / f"{stem}_{counter}{src.suffix}"
+                    counter += 1
+            try:
+                src.rename(target)
+                item.setText(0, target.name)
+                item.setToolTip(0, str(target))
+                # Update the group data as well
+                group = item.data(0, Qt.ItemDataRole.UserRole)
+                if group and isinstance(group, DuplicateGroup):
+                    for f in group.files:
+                        if f.file_path == file_path:
+                            f.file_path = str(target)
+                            break
+                renamed += 1
+            except OSError as e:
+                failed.append(f"{src.name}: {e}")
+
+        msg = f"已重命名 {renamed} 个文件"
+        if failed:
+            msg += f"\n\n{len(failed)} 个文件重命名失败:\n" + "\n".join(failed[:5])
+        QMessageBox.information(self, "批量重命名完成", msg)
+
     # --- Filtering ---
 
     _METHOD_FILTER_MAP = {
@@ -348,6 +538,8 @@ class ResultsView(QWidget):
         1: "exact",     # 精准匹配
         2: "perceptual",# 感知哈希
         3: "feature",   # 特征匹配
+        4: "video",     # 视频查重
+        5: "semantic",  # AI 语义相似度
     }
 
     def _apply_filters(self):

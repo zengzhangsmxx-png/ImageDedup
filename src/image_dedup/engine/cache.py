@@ -51,6 +51,15 @@ CREATE TABLE IF NOT EXISTS scan_files (
     PRIMARY KEY (scan_id, file_path)
 );
 CREATE INDEX IF NOT EXISTS idx_scan_files_path ON scan_files(file_path);
+
+CREATE TABLE IF NOT EXISTS scan_progress (
+    progress_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_paths  TEXT NOT NULL,
+    started_at    REAL NOT NULL,
+    last_file_idx INTEGER NOT NULL DEFAULT 0,
+    total_files   INTEGER NOT NULL DEFAULT 0,
+    status        TEXT NOT NULL DEFAULT 'running'
+);
 """
 
 
@@ -88,6 +97,21 @@ class HashCache:
         ).fetchone()
         if tables is None:
             conn.executescript(_SCAN_HISTORY_SCHEMA)
+        # Migrate: add scan_progress table if missing
+        progress_table = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='scan_progress'"
+        ).fetchone()
+        if progress_table is None:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS scan_progress ("
+                "    progress_id   INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "    source_paths  TEXT NOT NULL,"
+                "    started_at    REAL NOT NULL,"
+                "    last_file_idx INTEGER NOT NULL DEFAULT 0,"
+                "    total_files   INTEGER NOT NULL DEFAULT 0,"
+                "    status        TEXT NOT NULL DEFAULT 'running'"
+                ")"
+            )
         conn.commit()
         # Cleanup old scans on startup
         self._cleanup_old_scans()
@@ -240,3 +264,60 @@ class HashCache:
                 logger.info("Cleaned up %d old scan records", len(old_ids))
         except Exception as e:
             logger.debug("Scan cleanup: %s", e)
+
+    # --- Scan progress (resume support) ---
+
+    def save_scan_progress(self, source_paths: list[str], file_idx: int, total: int) -> None:
+        """Upsert progress for given source paths. Creates a new row if none
+        exists with status='running', otherwise updates the existing one."""
+        key = json.dumps(source_paths, ensure_ascii=False)
+        conn = self._conn()
+        row = conn.execute(
+            "SELECT progress_id FROM scan_progress "
+            "WHERE source_paths=? AND status='running' "
+            "ORDER BY progress_id DESC LIMIT 1",
+            (key,),
+        ).fetchone()
+        if row is not None:
+            conn.execute(
+                "UPDATE scan_progress SET last_file_idx=?, total_files=? "
+                "WHERE progress_id=?",
+                (file_idx, total, row[0]),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO scan_progress (source_paths, started_at, last_file_idx, total_files, status) "
+                "VALUES (?, ?, ?, ?, 'running')",
+                (key, time.time(), file_idx, total),
+            )
+        conn.commit()
+
+    def get_interrupted_scan(self, source_paths: list[str]) -> dict | None:
+        """Return the last interrupted (status='running') progress record
+        for the given source paths, or None if there is no interrupted scan."""
+        key = json.dumps(source_paths, ensure_ascii=False)
+        row = self._conn().execute(
+            "SELECT progress_id, started_at, last_file_idx, total_files "
+            "FROM scan_progress "
+            "WHERE source_paths=? AND status='running' "
+            "ORDER BY progress_id DESC LIMIT 1",
+            (key,),
+        ).fetchone()
+        if row is None:
+            return None
+        return dict(
+            progress_id=row[0], started_at=row[1],
+            last_file_idx=row[2], total_files=row[3],
+        )
+
+    def clear_scan_progress(self, source_paths: list[str]) -> None:
+        """Mark the running progress record for the given source paths as
+        completed. If no running record exists this is a no-op."""
+        key = json.dumps(source_paths, ensure_ascii=False)
+        conn = self._conn()
+        conn.execute(
+            "UPDATE scan_progress SET status='completed' "
+            "WHERE source_paths=? AND status='running'",
+            (key,),
+        )
+        conn.commit()

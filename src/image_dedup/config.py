@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 
@@ -34,18 +34,58 @@ class AppConfig:
     canny_high: int = 150
     forensic_max_dim: int = 2048
 
+    # Theme
+    theme: str = "light"
+
+    # Video dedup
+    video_keyframe_interval: float = 2.0
+    video_phash_threshold: int = 10
+
+    # AI semantic
+    semantic_enabled: bool = False
+    semantic_model: str = "ViT-B/32"
+    semantic_threshold: float = 0.85
+
+    # Cross-document dedup
+    cross_doc_enabled: bool = False
+
+    # Batch operations
+    batch_move_dir: str = ""
+    auto_keep_best: bool = True
+    batch_rename_pattern: str = "{prefix}_{index:03d}"
+
+    # Performance
+    gpu_acceleration: bool = False
+    scan_batch_size: int = 10000
+    resume_scan_enabled: bool = True
+
+    # Scheduled scan
+    scheduled_scan_enabled: bool = False
+    scheduled_scan_interval_min: int = 30
+    scheduled_scan_paths: list[str] = field(default_factory=list)
+
+    # System tray
+    minimize_to_tray: bool = False
+    file_watcher_enabled: bool = False
+    file_watcher_paths: list[str] = field(default_factory=list)
+
+    # Format support
+    heic_enabled: bool = True
+    avif_enabled: bool = True
+
+    # Extract location
+    extract_to_archive_dir: bool = True
+
     # System settings
     log_level: str = "INFO"
 
 
 def config_path() -> Path:
-    """Return the path to the settings.json file."""
     config_dir = Path.home() / ".config" / "image_dedup"
     return config_dir / "settings.json"
 
 
 def load_config() -> AppConfig:
-    """Load configuration from settings.json, or return defaults if not found."""
     path = config_path()
     if not path.exists():
         return AppConfig()
@@ -53,17 +93,14 @@ def load_config() -> AppConfig:
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        # Filter out unknown keys for forward compatibility
         valid_keys = {f.name for f in AppConfig.__dataclass_fields__.values()}
         filtered = {k: v for k, v in data.items() if k in valid_keys}
         return AppConfig(**filtered)
     except Exception:
-        # If loading fails, return defaults
         return AppConfig()
 
 
 def save_config(config: AppConfig) -> None:
-    """Save configuration to settings.json."""
     path = config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
 

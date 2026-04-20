@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QProgressBar,
     QPushButton,
@@ -33,6 +35,7 @@ from ..logging_setup import get_logger
 from .forensic_dialog import ForensicDialog
 from .image_viewer_dialog import ImageViewerDialog
 from .results_view import ResultsView
+from .tray import SystemTrayManager
 from .widgets import DropTreeWidget, ThresholdSlider
 
 logger = get_logger("main_window")
@@ -44,6 +47,9 @@ class ScanOptions:
     perceptual: bool = True
     feature_match: bool = False
     perceptual_threshold: int = 10
+    video_dedup: bool = False
+    semantic: bool = False
+    cross_doc: bool = False
 
 
 class ScanWorker(QObject):
@@ -93,6 +99,11 @@ class ScanWorker(QObject):
                     0, 0,
                 )
 
+            # Cross-doc: flatten all files into global pool
+            if self._options.cross_doc:
+                for f in files:
+                    f.source_group = None
+
             # Partition by source_group: None = global pool, else per-document
             global_files: list = []
             doc_groups: dict[str, list] = {}
@@ -118,6 +129,78 @@ class ScanWorker(QObject):
                 groups = self._run_dedup(doc_files, cache, gid_offset, scan_errors)
                 all_groups.extend(groups)
                 gid_offset = max((g.group_id for g in all_groups), default=0)
+
+            # --- Video dedup ---
+            if self._options.video_dedup:
+                self.progress.emit("视频查重...", 0, 0)
+                try:
+                    from ..engine.video import VideoProcessor, VIDEO_EXTENSIONS
+
+                    processor = VideoProcessor(
+                        interval=self._config.video_keyframe_interval,
+                        config=self._config,
+                    )
+
+                    # Collect video files from sources
+                    video_paths: list[str] = []
+                    for src in self._sources:
+                        p = Path(src)
+                        if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS:
+                            video_paths.append(str(p))
+                        elif p.is_dir():
+                            for ext in VIDEO_EXTENSIONS:
+                                video_paths.extend(str(vf) for vf in p.rglob(f"*{ext}"))
+
+                    if len(video_paths) >= 2:
+                        video_hashes = []
+                        for idx, vp in enumerate(video_paths):
+                            self.progress.emit("提取视频关键帧...", idx + 1, len(video_paths))
+                            vh = processor.compute_video_hashes(vp)
+                            if vh is not None:
+                                video_hashes.append(vh)
+
+                        if len(video_hashes) >= 2:
+                            self.progress.emit("比对视频...", 0, 0)
+                            video_groups = processor.find_similar_videos(
+                                video_hashes,
+                                threshold=self._config.video_phash_threshold,
+                            )
+                            offset = max((g.group_id for g in all_groups), default=0)
+                            for g in video_groups:
+                                g.group_id += offset
+                            all_groups.extend(video_groups)
+                except Exception as e:
+                    logger.warning(f"视频查重失败: {e}")
+
+            # --- AI semantic similarity ---
+            if self._options.semantic:
+                self.progress.emit("AI 语义分析...", 0, 0)
+                try:
+                    from ..engine.semantic import SemanticEngine
+
+                    engine = SemanticEngine(
+                        model_name=self._config.semantic_model,
+                        device="cuda" if self._config.gpu_acceleration else "cpu",
+                    )
+
+                    image_paths = [str(f.path) for f in files]
+                    embeddings = engine.compute_embeddings_batch(
+                        image_paths,
+                        progress_callback=lambda cur, tot: self.progress.emit("AI 语义嵌入...", cur, tot),
+                    )
+
+                    if len(embeddings) >= 2:
+                        self.progress.emit("语义相似度比对...", 0, 0)
+                        semantic_groups = engine.find_semantic_duplicates(
+                            embeddings,
+                            threshold=self._config.semantic_threshold,
+                        )
+                        offset = max((g.group_id for g in all_groups), default=0)
+                        for g in semantic_groups:
+                            g.group_id += offset
+                        all_groups.extend(semantic_groups)
+                except Exception as e:
+                    logger.warning(f"AI 语义分析失败: {e}")
 
             total_files = sum(len(g.files) for g in all_groups)
             cache.finish_scan(scan_id, total_files, len(all_groups))
@@ -175,6 +258,16 @@ class ScanWorker(QObject):
         return groups
 
 
+def _format_eta(seconds: float) -> str:
+    """Format seconds into Chinese time string like '1分23秒' or '45秒'."""
+    seconds = max(0, int(seconds))
+    if seconds >= 60:
+        minutes = seconds // 60
+        secs = seconds % 60
+        return f"{minutes}分{secs}秒"
+    return f"{seconds}秒"
+
+
 class MainWindow(QMainWindow):
     def __init__(self, config: AppConfig | None = None):
         super().__init__()
@@ -186,6 +279,7 @@ class MainWindow(QMainWindow):
         self._worker: ScanWorker | None = None
         self._groups: list[DuplicateGroup] = []
         self._scanner: Scanner | None = None  # Keep scanner alive for temp files
+        self._scan_start_time: float | None = None
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -207,6 +301,21 @@ class MainWindow(QMainWindow):
         self._status = QStatusBar()
         self.setStatusBar(self._status)
         self._status.showMessage("就绪")
+
+        # System tray
+        self._tray_manager = SystemTrayManager(self, self._config)
+        self._tray_manager.setup_tray()
+
+        if self._config.file_watcher_enabled and self._config.file_watcher_paths:
+            self._tray_manager.setup_file_watcher(self._config.file_watcher_paths)
+
+        if self._config.scheduled_scan_enabled and self._config.scheduled_scan_paths:
+            self._tray_manager.setup_scheduled_scan(
+                self._config.scheduled_scan_interval_min,
+                self._config.scheduled_scan_paths,
+            )
+
+        self._tray_manager.scan_requested.connect(self._on_tray_scan_requested)
 
     def _build_left_panel(self) -> QWidget:
         panel = QWidget()
@@ -244,9 +353,15 @@ class MainWindow(QMainWindow):
         self._chk_perceptual = QCheckBox("感知哈希 (pHash)")
         self._chk_perceptual.setChecked(True)
         self._chk_feature = QCheckBox("特征匹配 (ORB)")
+        self._chk_video = QCheckBox("视频查重")
+        self._chk_semantic = QCheckBox("AI 语义相似度")
+        self._chk_cross_doc = QCheckBox("跨文档查重")
         method_layout.addWidget(self._chk_exact)
         method_layout.addWidget(self._chk_perceptual)
         method_layout.addWidget(self._chk_feature)
+        method_layout.addWidget(self._chk_video)
+        method_layout.addWidget(self._chk_semantic)
+        method_layout.addWidget(self._chk_cross_doc)
 
         self._threshold_slider = ThresholdSlider()
         method_layout.addWidget(self._threshold_slider)
@@ -263,9 +378,14 @@ class MainWindow(QMainWindow):
         self._btn_scan.clicked.connect(self._on_scan)
         layout.addWidget(self._btn_scan)
 
-        self._btn_report = QPushButton("生成 HTML 报告")
+        # Report dropdown button
+        self._btn_report = QPushButton("导出报告 ▾")
         self._btn_report.setEnabled(False)
-        self._btn_report.clicked.connect(self._on_generate_report)
+        report_menu = QMenu(self._btn_report)
+        report_menu.addAction("导出 HTML 报告", self._on_generate_html_report)
+        report_menu.addAction("导出 Excel 报告", self._on_generate_excel_report)
+        report_menu.addAction("导出 PDF 报告", self._on_generate_pdf_report)
+        self._btn_report.setMenu(report_menu)
         layout.addWidget(self._btn_report)
 
         self._btn_settings = QPushButton("设置")
@@ -327,8 +447,12 @@ class MainWindow(QMainWindow):
             perceptual=self._chk_perceptual.isChecked(),
             feature_match=self._chk_feature.isChecked(),
             perceptual_threshold=self._threshold_slider.value(),
+            video_dedup=self._chk_video.isChecked(),
+            semantic=self._chk_semantic.isChecked(),
+            cross_doc=self._chk_cross_doc.isChecked(),
         )
 
+        self._scan_start_time = time.monotonic()
         self._set_scanning(True)
         self._results_view.clear()
 
@@ -343,6 +467,17 @@ class MainWindow(QMainWindow):
         self._worker.error.connect(self._thread.quit)
         self._thread.start()
 
+    def _on_tray_scan_requested(self, paths: list[str]):
+        """Handle scan request from system tray."""
+        if paths:
+            for p in paths:
+                pp = Path(p)
+                if pp.is_dir():
+                    self._source_list.add_folder(pp)
+                elif pp.is_file():
+                    self._source_list.add_file(pp)
+        self._on_scan()
+
     def _set_scanning(self, scanning: bool):
         self._btn_scan.setEnabled(not scanning)
         self._btn_report.setEnabled(not scanning and bool(self._groups))
@@ -351,12 +486,23 @@ class MainWindow(QMainWindow):
             self._progress_bar.setRange(0, 0)
 
     def _on_progress(self, stage: str, current: int, total: int):
-        self._status.showMessage(f"{stage} {current}/{total}" if total else stage)
         if total > 0:
             self._progress_bar.setRange(0, total)
             self._progress_bar.setValue(current)
+
+            pct = int(current * 100 / total) if total else 0
+            msg = f"{stage} {current}/{total} ({pct}%)"
+
+            # ETA calculation
+            if current > 0 and self._scan_start_time is not None:
+                elapsed = time.monotonic() - self._scan_start_time
+                remaining = (elapsed / current) * (total - current)
+                msg += f" — 预计剩余 {_format_eta(remaining)}"
+
+            self._status.showMessage(msg)
         else:
             self._progress_bar.setRange(0, 0)
+            self._status.showMessage(stage)
 
     def _on_scan_finished(self, groups: list[DuplicateGroup], scanner: Scanner, scan_errors: ScanErrors, delta_info):
         # Clean up previous scanner's temp files, keep new one alive
@@ -365,6 +511,7 @@ class MainWindow(QMainWindow):
         self._scanner = scanner
 
         self._groups = groups
+        self._scan_start_time = None
         self._set_scanning(False)
         self._results_view.set_results(groups)
         self._btn_report.setEnabled(bool(groups))
@@ -385,6 +532,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "结果", "未发现重复图片")
 
     def _on_scan_error(self, msg: str):
+        self._scan_start_time = None
         self._set_scanning(False)
         QMessageBox.critical(self, "扫描出错", msg)
         self._status.showMessage("扫描出错")
@@ -407,14 +555,18 @@ class MainWindow(QMainWindow):
         dlg.exec()
 
     def closeEvent(self, event):
+        if self._config.minimize_to_tray:
+            event.ignore()
+            self.hide()
+            return
         if self._scanner is not None:
             self._scanner.cleanup()
             self._scanner = None
         super().closeEvent(event)
 
-    # --- Report ---
+    # --- Reports ---
 
-    def _on_generate_report(self):
+    def _on_generate_html_report(self):
         if not self._groups:
             return
         path, _ = QFileDialog.getSaveFileName(
@@ -431,8 +583,47 @@ class MainWindow(QMainWindow):
             out = gen.generate(self._groups, path)
             QMessageBox.information(self, "报告已生成", f"报告已保存到:\n{out}")
             self._status.showMessage(f"报告已保存: {out}")
-            # Open in browser
             import webbrowser
             webbrowser.open(f"file://{out}")
+        except Exception as e:
+            QMessageBox.critical(self, "生成报告失败", str(e))
+
+    def _on_generate_excel_report(self):
+        if not self._groups:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "保存 Excel 报告", "dedup_report.xlsx",
+            "Excel 文件 (*.xlsx);;所有文件 (*)",
+        )
+        if not path:
+            return
+
+        from ..report.excel_report import ExcelReportGenerator
+
+        try:
+            gen = ExcelReportGenerator()
+            out = gen.generate(self._groups, path)
+            QMessageBox.information(self, "报告已生成", f"报告已保存到:\n{out}")
+            self._status.showMessage(f"报告已保存: {out}")
+        except Exception as e:
+            QMessageBox.critical(self, "生成报告失败", str(e))
+
+    def _on_generate_pdf_report(self):
+        if not self._groups:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "保存 PDF 报告", "dedup_report.pdf",
+            "PDF 文件 (*.pdf);;所有文件 (*)",
+        )
+        if not path:
+            return
+
+        from ..report.pdf_report import PDFReportGenerator
+
+        try:
+            gen = PDFReportGenerator()
+            out = gen.generate(self._groups, path)
+            QMessageBox.information(self, "报告已生成", f"报告已保存到:\n{out}")
+            self._status.showMessage(f"报告已保存: {out}")
         except Exception as e:
             QMessageBox.critical(self, "生成报告失败", str(e))

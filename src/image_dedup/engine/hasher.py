@@ -19,6 +19,17 @@ from PIL import Image
 from .cache import HashCache
 from .scanner import ImageFile
 
+# ---------------------------------------------------------------------------
+# GPU detection — set once at import time
+# ---------------------------------------------------------------------------
+_USE_CUDA = False
+try:
+    import cv2
+    if cv2.cuda.getCudaEnabledDeviceCount() > 0:
+        _USE_CUDA = True
+except Exception:
+    pass
+
 
 @dataclass
 class ImageHashes:
@@ -132,25 +143,36 @@ class HashEngine:
         if not to_compute:
             return results
 
-        # Parallel hash computation with chunksize
-        batch_for_cache: list[tuple[str, int, float, dict]] = []
-        paths = [str(f.path) for f in to_compute]
-        chunksize = max(1, len(paths) // (self._max_workers * 4))
+        # --- Batch processing ---
+        # Split uncached files into chunks to bound memory usage and allow
+        # incremental cache flushes on large file sets.
+        batch_size = getattr(self._config, "scan_batch_size", 10000)
         compute_fn = partial(_compute_single, top_crop_ratio=self._config.top_crop_ratio)
-        with ProcessPoolExecutor(max_workers=self._max_workers) as pool:
-            for h in pool.map(compute_fn, paths, chunksize=chunksize):
-                if h is not None and not h.get("_error"):
-                    ih = ImageHashes(**h)
-                    results.append(ih)
-                    f = file_map[h["file_path"]]
-                    batch_for_cache.append((h["file_path"], f.file_size, mtime_map[h["file_path"]], h))
-                elif h is not None and h.get("_error") and errors:
-                    errors.add(h["file_path"], "hash", Exception(h["message"]))
-                if progress_callback:
-                    progress_callback(len(results), total)
 
-        if batch_for_cache:
-            self._cache.put_batch(batch_for_cache)
+        for batch_start in range(0, len(to_compute), batch_size):
+            batch = to_compute[batch_start : batch_start + batch_size]
+            paths = [str(f.path) for f in batch]
+            chunksize = max(1, len(paths) // (self._max_workers * 4))
+
+            batch_for_cache: list[tuple[str, int, float, dict]] = []
+            with ProcessPoolExecutor(max_workers=self._max_workers) as pool:
+                for h in pool.map(compute_fn, paths, chunksize=chunksize):
+                    if h is not None and not h.get("_error"):
+                        ih = ImageHashes(**h)
+                        results.append(ih)
+                        f = file_map[h["file_path"]]
+                        batch_for_cache.append((
+                            h["file_path"], f.file_size,
+                            mtime_map[h["file_path"]], h,
+                        ))
+                    elif h is not None and h.get("_error") and errors:
+                        errors.add(h["file_path"], "hash", Exception(h["message"]))
+                    if progress_callback:
+                        progress_callback(len(results), total)
+
+            # Flush cache after each batch so progress is durable
+            if batch_for_cache:
+                self._cache.put_batch(batch_for_cache)
 
         return results
 
