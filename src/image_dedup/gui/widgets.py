@@ -160,9 +160,15 @@ def _extract_archive(archive_path: Path, dest_dir: Path):
 
 def _get_extract_base() -> Path:
     """Get the extraction base directory, compatible with PyInstaller."""
-    # Use user's home directory to ensure persistence across runs
-    # and compatibility with PyInstaller (where __file__ points to temp dir)
-    base = Path.home() / ".cache" / "ImageDedup" / "extracted"
+    # Use current working directory for user-visible extraction
+    # In PyInstaller, sys.executable points to the .exe, use its parent directory
+    import sys
+    if getattr(sys, 'frozen', False):
+        # Running as PyInstaller bundle
+        base = Path(sys.executable).parent / "ImageDedup"
+    else:
+        # Running as script
+        base = Path.cwd() / "ImageDedup"
     base.mkdir(parents=True, exist_ok=True)
     return base
 
