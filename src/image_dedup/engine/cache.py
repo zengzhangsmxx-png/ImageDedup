@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
+
+from ..logging_setup import get_logger
+
+logger = get_logger("cache")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS hash_cache (
@@ -25,6 +31,26 @@ CREATE TABLE IF NOT EXISTS hash_cache (
 );
 CREATE INDEX IF NOT EXISTS idx_md5 ON hash_cache(md5);
 CREATE INDEX IF NOT EXISTS idx_phash ON hash_cache(phash);
+"""
+
+_SCAN_HISTORY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS scan_history (
+    scan_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at   REAL NOT NULL,
+    finished_at  REAL,
+    source_paths TEXT NOT NULL,
+    total_files  INTEGER DEFAULT 0,
+    total_groups INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS scan_files (
+    scan_id    INTEGER NOT NULL,
+    file_path  TEXT NOT NULL,
+    file_size  INTEGER NOT NULL,
+    mtime      REAL NOT NULL,
+    PRIMARY KEY (scan_id, file_path)
+);
+CREATE INDEX IF NOT EXISTS idx_scan_files_path ON scan_files(file_path);
 """
 
 
@@ -56,7 +82,15 @@ class HashCache:
             conn.execute("SELECT phash_top FROM hash_cache LIMIT 1")
         except sqlite3.OperationalError:
             conn.execute("ALTER TABLE hash_cache ADD COLUMN phash_top TEXT NOT NULL DEFAULT ''")
+        # Migrate: add scan_history tables if missing
+        tables = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='scan_history'"
+        ).fetchone()
+        if tables is None:
+            conn.executescript(_SCAN_HISTORY_SCHEMA)
         conn.commit()
+        # Cleanup old scans on startup
+        self._cleanup_old_scans()
 
     def get(self, file_path: str, file_size: int, mtime: float) -> dict | None:
         row = self._conn().execute(
@@ -128,3 +162,81 @@ class HashCache:
 
     def count(self) -> int:
         return self._conn().execute("SELECT COUNT(*) FROM hash_cache").fetchone()[0]
+
+    # --- Scan history ---
+
+    def start_scan(self, source_paths: list[str]) -> int:
+        conn = self._conn()
+        cur = conn.execute(
+            "INSERT INTO scan_history (started_at, source_paths) VALUES (?, ?)",
+            (time.time(), json.dumps(source_paths, ensure_ascii=False)),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+    def record_scan_files_batch(self, scan_id: int, files: list[tuple[str, int, float]]) -> None:
+        conn = self._conn()
+        conn.executemany(
+            "INSERT OR REPLACE INTO scan_files (scan_id, file_path, file_size, mtime) VALUES (?,?,?,?)",
+            [(scan_id, fp, fs, mt) for fp, fs, mt in files],
+        )
+        conn.commit()
+
+    def finish_scan(self, scan_id: int, total_files: int, total_groups: int) -> None:
+        conn = self._conn()
+        conn.execute(
+            "UPDATE scan_history SET finished_at=?, total_files=?, total_groups=? WHERE scan_id=?",
+            (time.time(), total_files, total_groups, scan_id),
+        )
+        conn.commit()
+
+    def get_last_scan(self, source_paths: list[str]) -> dict | None:
+        key = json.dumps(source_paths, ensure_ascii=False)
+        row = self._conn().execute(
+            "SELECT scan_id, started_at, finished_at, total_files, total_groups "
+            "FROM scan_history WHERE source_paths=? AND finished_at IS NOT NULL "
+            "ORDER BY scan_id DESC LIMIT 1",
+            (key,),
+        ).fetchone()
+        if row is None:
+            return None
+        return dict(scan_id=row[0], started_at=row[1], finished_at=row[2],
+                    total_files=row[3], total_groups=row[4])
+
+    def get_scan_delta(self, scan_id: int, current_files: list[tuple[str, int, float]]) -> tuple[list, list, list]:
+        """Compare current file list against previous scan.
+        Returns (new_files, modified_files, deleted_files)."""
+        prev = {}
+        for row in self._conn().execute(
+            "SELECT file_path, file_size, mtime FROM scan_files WHERE scan_id=?", (scan_id,),
+        ).fetchall():
+            prev[row[0]] = (row[1], row[2])
+
+        new_files = []
+        modified_files = []
+        current_paths = set()
+        for fp, fs, mt in current_files:
+            current_paths.add(fp)
+            if fp not in prev:
+                new_files.append(fp)
+            elif prev[fp] != (fs, mt):
+                modified_files.append(fp)
+
+        deleted_files = [fp for fp in prev if fp not in current_paths]
+        return new_files, modified_files, deleted_files
+
+    def _cleanup_old_scans(self, days: int = 30) -> None:
+        try:
+            cutoff = time.time() - days * 86400
+            conn = self._conn()
+            old_ids = [r[0] for r in conn.execute(
+                "SELECT scan_id FROM scan_history WHERE started_at < ?", (cutoff,),
+            ).fetchall()]
+            if old_ids:
+                placeholders = ",".join("?" * len(old_ids))
+                conn.execute(f"DELETE FROM scan_files WHERE scan_id IN ({placeholders})", old_ids)
+                conn.execute(f"DELETE FROM scan_history WHERE scan_id IN ({placeholders})", old_ids)
+                conn.commit()
+                logger.info("Cleaned up %d old scan records", len(old_ids))
+        except Exception as e:
+            logger.debug("Scan cleanup: %s", e)

@@ -26,10 +26,10 @@ from .widgets import ImageViewer
 class ForensicDialog(QDialog):
     """Forensic analysis dialog with 5 tabs."""
 
-    def __init__(self, group: DuplicateGroup, parent=None):
+    def __init__(self, group: DuplicateGroup, parent=None, config=None):
         super().__init__(parent)
         self._group = group
-        self._analyzer = ForensicAnalyzer()
+        self._analyzer = ForensicAnalyzer(config)
         self._loaded_tabs: set[int] = set()
 
         self.setWindowTitle(f"取证分析 — 重复组 #{group.group_id}")

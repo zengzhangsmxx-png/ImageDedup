@@ -11,6 +11,10 @@ from PIL import Image
 from PIL.ExifTags import TAGS
 from scipy.ndimage import gaussian_filter
 
+from ..logging_setup import get_logger
+
+logger = get_logger("forensics")
+
 
 @dataclass
 class MetadataComparison:
@@ -74,8 +78,8 @@ def _extract_exif(path: str) -> dict[str, str]:
         for tag_id, value in exif.items():
             tag_name = TAGS.get(tag_id, str(tag_id))
             meta[tag_name] = str(value)[:200]
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("EXIF extraction failed for %s: %s", path, e)
     return meta
 
 
@@ -101,6 +105,10 @@ def _align_sizes(a: np.ndarray, b: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 class ForensicAnalyzer:
 
+    def __init__(self, config=None):
+        from ..config import AppConfig
+        self._config = config or AppConfig()
+
     def compare_metadata(self, path_a: str, path_b: str) -> MetadataComparison:
         meta_a = _extract_exif(path_a)
         meta_b = _extract_exif(path_b)
@@ -114,8 +122,8 @@ class ForensicAnalyzer:
         return MetadataComparison(meta_a, meta_b, diffs)
 
     def pixel_diff(self, path_a: str, path_b: str, threshold: int = 30) -> PixelDiffResult | None:
-        a = _load_cv2_rgb(path_a)
-        b = _load_cv2_rgb(path_b)
+        a = _load_cv2_rgb(path_a, max_dim=self._config.forensic_max_dim)
+        b = _load_cv2_rgb(path_b, max_dim=self._config.forensic_max_dim)
         if a is None or b is None:
             return None
         a, b = _align_sizes(a, b)
@@ -137,8 +145,10 @@ class ForensicAnalyzer:
             diff_percentage=round(pct, 2),
         )
 
-    def error_level_analysis(self, path: str, quality: int = 90) -> np.ndarray | None:
+    def error_level_analysis(self, path: str, quality: int | None = None) -> np.ndarray | None:
         """ELA: re-save at known JPEG quality, compute amplified difference."""
+        if quality is None:
+            quality = self._config.ela_quality
         try:
             img = Image.open(path).convert("RGB")
             buf = io.BytesIO()
@@ -150,23 +160,27 @@ class ForensicAnalyzer:
             resaved_arr = np.array(resaved, dtype=np.float32)
 
             diff = np.abs(orig_arr - resaved_arr)
-            # Amplify for visibility
-            ela = np.clip(diff * 20, 0, 255).astype(np.uint8)
+            ela = np.clip(diff * self._config.ela_amplification, 0, 255).astype(np.uint8)
             return ela
-        except Exception:
+        except Exception as e:
+            logger.debug("ELA failed for %s: %s", path, e)
             return None
 
-    def ela_compare(self, path_a: str, path_b: str, quality: int = 90) -> ELAResult | None:
+    def ela_compare(self, path_a: str, path_b: str, quality: int | None = None) -> ELAResult | None:
+        if quality is None:
+            quality = self._config.ela_quality
         ela_a = self.error_level_analysis(path_a, quality)
         ela_b = self.error_level_analysis(path_b, quality)
         if ela_a is None or ela_b is None:
             return None
         return ELAResult(ela_image_a=ela_a, ela_image_b=ela_b, quality_used=quality)
 
-    def noise_analysis(self, path_a: str, path_b: str, sigma: float = 3.0) -> NoiseAnalysis | None:
+    def noise_analysis(self, path_a: str, path_b: str, sigma: float | None = None) -> NoiseAnalysis | None:
         """High-pass filter to reveal noise patterns."""
-        a = _load_cv2_rgb(path_a)
-        b = _load_cv2_rgb(path_b)
+        if sigma is None:
+            sigma = self._config.noise_sigma
+        a = _load_cv2_rgb(path_a, max_dim=self._config.forensic_max_dim)
+        b = _load_cv2_rgb(path_b, max_dim=self._config.forensic_max_dim)
         if a is None or b is None:
             return None
 
@@ -195,8 +209,8 @@ class ForensicAnalyzer:
         )
 
     def lighting_analysis(self, path_a: str, path_b: str) -> LightingAnalysis | None:
-        a = _load_cv2_rgb(path_a)
-        b = _load_cv2_rgb(path_b)
+        a = _load_cv2_rgb(path_a, max_dim=self._config.forensic_max_dim)
+        b = _load_cv2_rgb(path_b, max_dim=self._config.forensic_max_dim)
         if a is None or b is None:
             return None
         a, b = _align_sizes(a, b)
@@ -218,8 +232,8 @@ class ForensicAnalyzer:
         ))
 
         # Canny edge detection
-        edges_a = cv2.Canny(a_gray, 50, 150)
-        edges_b = cv2.Canny(b_gray, 50, 150)
+        edges_a = cv2.Canny(a_gray, self._config.canny_low, self._config.canny_high)
+        edges_b = cv2.Canny(b_gray, self._config.canny_low, self._config.canny_high)
 
         return LightingAnalysis(
             histogram_a=hist_a, histogram_b=hist_b,
@@ -227,8 +241,10 @@ class ForensicAnalyzer:
             edges_a=edges_a, edges_b=edges_b,
         )
 
-    def single_noise_analysis(self, path: str, sigma: float = 3.0) -> SingleNoiseResult | None:
-        img = _load_cv2_rgb(path)
+    def single_noise_analysis(self, path: str, sigma: float | None = None) -> SingleNoiseResult | None:
+        if sigma is None:
+            sigma = self._config.noise_sigma
+        img = _load_cv2_rgb(path, max_dim=self._config.forensic_max_dim)
         if img is None:
             return None
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
@@ -246,11 +262,11 @@ class ForensicAnalyzer:
         )
 
     def single_lighting_analysis(self, path: str) -> SingleLightingResult | None:
-        img = _load_cv2_rgb(path)
+        img = _load_cv2_rgb(path, max_dim=self._config.forensic_max_dim)
         if img is None:
             return None
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         hist = cv2.calcHist([gray], [0], None, [256], [0, 256]).flatten()
         hist = hist / (hist.sum() + 1e-8)
-        edges = cv2.Canny(gray, 50, 150)
+        edges = cv2.Canny(gray, self._config.canny_low, self._config.canny_high)
         return SingleLightingResult(histogram=hist, edges=edges)

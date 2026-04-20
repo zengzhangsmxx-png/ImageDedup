@@ -20,12 +20,12 @@ from .widgets import ImageViewer
 class ImageViewerDialog(QDialog):
     """macOS Preview-like borderless overlay viewer."""
 
-    def __init__(self, file_path: str, group: DuplicateGroup, parent=None):
+    def __init__(self, file_path: str, group: DuplicateGroup, parent=None, config=None):
         super().__init__(parent)
         self._file_path = file_path
         self._group = group
         self._loaded_tabs: set[int] = set()
-        self._analyzer = ForensicAnalyzer()
+        self._analyzer = ForensicAnalyzer(config)
 
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint | Qt.WindowType.Dialog

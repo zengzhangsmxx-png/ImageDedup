@@ -8,6 +8,7 @@ import time
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Callable
 
@@ -43,7 +44,7 @@ class DuplicateGroup:
     multi_account: bool = False
 
 
-def _compute_single(file_path: str) -> dict | None:
+def _compute_single(file_path: str, top_crop_ratio: float = 0.08) -> dict | None:
     """Compute all hashes for one image. Runs in a worker process."""
     try:
         path = Path(file_path)
@@ -61,8 +62,8 @@ def _compute_single(file_path: str) -> dict | None:
         dh = str(imagehash.dhash(img))
         ah = str(imagehash.average_hash(img))
 
-        # Top 8% crop hash — captures status bar differences on phone screenshots
-        top_h = max(1, int(h * 0.08))
+        # Top crop hash — captures status bar differences on phone screenshots
+        top_h = max(1, int(h * top_crop_ratio))
         top_crop = img.crop((0, 0, w, top_h))
         ph_top = str(imagehash.phash(top_crop))
 
@@ -72,19 +73,22 @@ def _compute_single(file_path: str) -> dict | None:
             file_size=len(data), width=w, height=h,
             computed_at=time.time(),
         )
-    except Exception:
-        return None
+    except Exception as e:
+        return {"_error": True, "file_path": file_path, "message": str(e)}
 
 
 class HashEngine:
-    def __init__(self, cache: HashCache, max_workers: int | None = None):
+    def __init__(self, cache: HashCache, max_workers: int | None = None, config=None):
+        from ..config import AppConfig
+        self._config = config or AppConfig()
         self._cache = cache
-        self._max_workers = max_workers or min(os.cpu_count() or 4, 8)
+        self._max_workers = max_workers or self._config.max_workers
 
     def compute_hashes(
         self,
         files: list[ImageFile],
         progress_callback: Callable[[int, int], None] | None = None,
+        errors=None,
     ) -> list[ImageHashes]:
         results: list[ImageHashes] = []
         to_compute: list[ImageFile] = []
@@ -132,13 +136,16 @@ class HashEngine:
         batch_for_cache: list[tuple[str, int, float, dict]] = []
         paths = [str(f.path) for f in to_compute]
         chunksize = max(1, len(paths) // (self._max_workers * 4))
+        compute_fn = partial(_compute_single, top_crop_ratio=self._config.top_crop_ratio)
         with ProcessPoolExecutor(max_workers=self._max_workers) as pool:
-            for h in pool.map(_compute_single, paths, chunksize=chunksize):
-                if h is not None:
+            for h in pool.map(compute_fn, paths, chunksize=chunksize):
+                if h is not None and not h.get("_error"):
                     ih = ImageHashes(**h)
                     results.append(ih)
                     f = file_map[h["file_path"]]
                     batch_for_cache.append((h["file_path"], f.file_size, mtime_map[h["file_path"]], h))
+                elif h is not None and h.get("_error") and errors:
+                    errors.add(h["file_path"], "hash", Exception(h["message"]))
                 if progress_callback:
                     progress_callback(len(results), total)
 
@@ -211,10 +218,8 @@ class HashEngine:
                     pa, pb = items[i][1].file_path, items[j][1].file_path
                     pair = tuple(sorted([pa, pb]))
                     if pair not in exact_pairs:
-                        # Blend: 80% full-image distance + 20% top-region distance
-                        # If phash_top is empty/same as phash, blending has no effect
                         dist_top = bin(top_items[i][0] ^ top_items[j][0]).count("1")
-                        blended = dist_full * 0.8 + dist_top * 0.2
+                        blended = dist_full * self._config.blend_ratio_full + dist_top * self._config.blend_ratio_top
                         adj[i].add(j)
                         adj[j].add(i)
                         pair_dist[(i, j)] = blended
@@ -257,8 +262,10 @@ class HashEngine:
                 avg_dist_top = total_dist_top / count if count else 0
                 similarity = max(0.0, 1.0 - avg_dist / 64.0)
 
-                # Multi-account detection: top region differs significantly more than body
-                is_multi_account = (avg_dist_top >= 2 and avg_dist_top > avg_dist_full * 1.5)
+                is_multi_account = (
+                    avg_dist_top >= self._config.multi_account_min_top_dist
+                    and avg_dist_top > avg_dist_full * self._config.multi_account_top_ratio
+                )
 
                 groups.append(DuplicateGroup(
                     group_id=gid, detection_method="perceptual",

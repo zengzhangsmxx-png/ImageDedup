@@ -7,6 +7,10 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..logging_setup import get_logger
+
+logger = get_logger("scanner")
+
 SUPPORTED_FORMATS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".tif"}
 DOCUMENT_FORMATS = {".xlsx", ".xls", ".pdf"}
 
@@ -25,7 +29,7 @@ class Scanner:
     def __init__(self):
         self._temp_dirs: list[tempfile.TemporaryDirectory] = []
 
-    def scan(self, paths: list[str | Path]) -> list[ImageFile]:
+    def scan(self, paths: list[str | Path], errors=None) -> list[ImageFile]:
         results: list[ImageFile] = []
         seen: set[str] = set()
         for p in paths:
@@ -35,9 +39,9 @@ class Scanner:
             elif p.is_file():
                 suffix = p.suffix.lower()
                 if suffix in (".zip",):
-                    results.extend(self._extract_archive(p, seen))
+                    results.extend(self._extract_archive(p, seen, errors))
                 elif suffix in DOCUMENT_FORMATS:
-                    results.extend(self._extract_document(p, seen))
+                    results.extend(self._extract_document(p, seen, errors))
                 elif suffix in SUPPORTED_FORMATS:
                     rp = str(p.resolve())
                     if rp not in seen:
@@ -65,7 +69,7 @@ class Scanner:
                     ))
         return results
 
-    def _extract_archive(self, archive_path: Path, seen: set[str]) -> list[ImageFile]:
+    def _extract_archive(self, archive_path: Path, seen: set[str], errors=None) -> list[ImageFile]:
         results = []
         td = tempfile.TemporaryDirectory(prefix="imgdedup_")
         self._temp_dirs.append(td)
@@ -84,19 +88,25 @@ class Scanner:
                             format=f.suffix.lower().lstrip("."),
                             source_type="archive",
                         ))
-        except zipfile.BadZipFile:
-            pass
+        except zipfile.BadZipFile as e:
+            logger.warning("Bad zip file: %s", archive_path)
+            if errors:
+                errors.add(str(archive_path), "scan", e)
+        except Exception as e:
+            logger.warning("Archive extraction failed %s: %s", archive_path, e)
+            if errors:
+                errors.add(str(archive_path), "scan", e)
         return results
 
-    def _extract_document(self, doc_path: Path, seen: set[str]) -> list[ImageFile]:
+    def _extract_document(self, doc_path: Path, seen: set[str], errors=None) -> list[ImageFile]:
         suffix = doc_path.suffix.lower()
         if suffix in (".xlsx", ".xls"):
-            return self._extract_xlsx(doc_path, seen)
+            return self._extract_xlsx(doc_path, seen, errors)
         elif suffix == ".pdf":
-            return self._extract_pdf(doc_path, seen)
+            return self._extract_pdf(doc_path, seen, errors)
         return []
 
-    def _extract_xlsx(self, doc_path: Path, seen: set[str]) -> list[ImageFile]:
+    def _extract_xlsx(self, doc_path: Path, seen: set[str], errors=None) -> list[ImageFile]:
         results = []
         td = tempfile.TemporaryDirectory(prefix="imgdedup_xlsx_")
         self._temp_dirs.append(td)
@@ -125,11 +135,13 @@ class Scanner:
                             source_group=str(doc_path),
                         ))
             wb.close()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("XLSX extraction failed %s: %s", doc_path, e)
+            if errors:
+                errors.add(str(doc_path), "scan", e)
         return results
 
-    def _extract_pdf(self, doc_path: Path, seen: set[str]) -> list[ImageFile]:
+    def _extract_pdf(self, doc_path: Path, seen: set[str], errors=None) -> list[ImageFile]:
         results = []
         td = tempfile.TemporaryDirectory(prefix="imgdedup_pdf_")
         self._temp_dirs.append(td)
@@ -158,17 +170,20 @@ class Scanner:
                                 source_type="document",
                                 source_group=str(doc_path),
                             ))
-                    except Exception:
+                    except Exception as e:
+                        logger.debug("PDF image skip xref=%d in %s: %s", xref, doc_path, e)
                         continue
             doc.close()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("PDF extraction failed %s: %s", doc_path, e)
+            if errors:
+                errors.add(str(doc_path), "scan", e)
         return results
 
     def cleanup(self):
         for td in self._temp_dirs:
             try:
                 td.cleanup()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Temp cleanup: %s", e)
         self._temp_dirs.clear()

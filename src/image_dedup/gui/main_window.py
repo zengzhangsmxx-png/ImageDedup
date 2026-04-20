@@ -8,6 +8,7 @@ from pathlib import Path
 from PyQt6.QtCore import QObject, QThread, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox,
+    QDialog,
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
@@ -22,14 +23,19 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from ..config import AppConfig
 from ..engine.cache import HashCache
+from ..engine.errors import ScanErrors
 from ..engine.feature import FeatureMatcher
 from ..engine.hasher import DuplicateGroup, HashEngine
 from ..engine.scanner import Scanner
+from ..logging_setup import get_logger
 from .forensic_dialog import ForensicDialog
 from .image_viewer_dialog import ImageViewerDialog
 from .results_view import ResultsView
 from .widgets import DropTreeWidget, ThresholdSlider
+
+logger = get_logger("main_window")
 
 
 @dataclass
@@ -44,25 +50,48 @@ class ScanWorker(QObject):
     """Runs the full scan pipeline in a background thread."""
 
     progress = pyqtSignal(str, int, int)  # stage, current, total
-    finished = pyqtSignal(list, object)  # list[DuplicateGroup], Scanner
+    finished = pyqtSignal(list, object, object, object)  # list[DuplicateGroup], Scanner, ScanErrors, delta_info
     error = pyqtSignal(str)
 
-    def __init__(self, sources: list[str], options: ScanOptions):
+    def __init__(self, sources: list[str], options: ScanOptions, config: AppConfig | None = None):
         super().__init__()
         self._sources = sources
         self._options = options
+        self._config = config or AppConfig()
 
     def run(self):
         try:
             scanner = Scanner()
             cache = HashCache()
+            scan_errors = ScanErrors()
+
+            # Start scan session
+            scan_id = cache.start_scan(self._sources)
 
             self.progress.emit("扫描文件...", 0, 0)
-            files = scanner.scan(self._sources)
+            files = scanner.scan(self._sources, errors=scan_errors)
             if not files:
                 scanner.cleanup()
-                self.finished.emit([], scanner)
+                cache.finish_scan(scan_id, 0, 0)
+                self.finished.emit([], scanner, scan_errors, None)
                 return
+
+            # Record files in scan session
+            cache.record_scan_files_batch(scan_id, [(str(f.path), f.file_size, f.path.stat().st_mtime) for f in files])
+
+            # Compute delta against last scan
+            last_scan = cache.get_last_scan(self._sources)
+            delta_info = None
+            if last_scan:
+                new, modified, deleted = cache.get_scan_delta(
+                    last_scan["scan_id"],
+                    [(str(f.path), f.file_size, f.path.stat().st_mtime) for f in files],
+                )
+                delta_info = {"new": len(new), "modified": len(modified), "deleted": len(deleted)}
+                self.progress.emit(
+                    f"增量扫描: {len(new)} 新增, {len(modified)} 修改, {len(deleted)} 删除",
+                    0, 0,
+                )
 
             # Partition by source_group: None = global pool, else per-document
             global_files: list = []
@@ -78,7 +107,7 @@ class ScanWorker(QObject):
 
             # Process global pool
             if global_files:
-                groups = self._run_dedup(global_files, cache, gid_offset)
+                groups = self._run_dedup(global_files, cache, gid_offset, scan_errors)
                 all_groups.extend(groups)
                 gid_offset = max((g.group_id for g in all_groups), default=0)
 
@@ -86,20 +115,25 @@ class ScanWorker(QObject):
             for doc_path, doc_files in doc_groups.items():
                 if len(doc_files) < 2:
                     continue
-                groups = self._run_dedup(doc_files, cache, gid_offset)
+                groups = self._run_dedup(doc_files, cache, gid_offset, scan_errors)
                 all_groups.extend(groups)
                 gid_offset = max((g.group_id for g in all_groups), default=0)
 
+            total_files = sum(len(g.files) for g in all_groups)
+            cache.finish_scan(scan_id, total_files, len(all_groups))
+
             # Don't cleanup — MainWindow holds scanner alive until next scan / close
-            self.finished.emit(all_groups, scanner)
+            self.finished.emit(all_groups, scanner, scan_errors, delta_info)
         except Exception as e:
+            logger.exception("Scan failed")
             self.error.emit(str(e))
 
-    def _run_dedup(self, files, cache, gid_offset) -> list[DuplicateGroup]:
-        hasher = HashEngine(cache)
+    def _run_dedup(self, files, cache, gid_offset, scan_errors=None) -> list[DuplicateGroup]:
+        hasher = HashEngine(cache, max_workers=self._config.max_workers, config=self._config)
         hashes = hasher.compute_hashes(
             files,
             progress_callback=lambda cur, tot: self.progress.emit("计算哈希...", cur, tot),
+            errors=scan_errors,
         )
 
         groups: list[DuplicateGroup] = []
@@ -123,10 +157,14 @@ class ScanWorker(QObject):
 
         if self._options.feature_match:
             self.progress.emit("ORB 特征匹配...", 0, 0)
-            matcher = FeatureMatcher()
+            matcher = FeatureMatcher(
+                n_features=self._config.orb_n_features,
+                ratio_threshold=self._config.orb_ratio_threshold,
+                max_dim=self._config.feature_max_dim,
+            )
             feature_groups = matcher.compare_candidates(
                 hashes,
-                min_score=0.15,
+                min_score=self._config.feature_min_score,
                 progress_callback=lambda cur, tot: self.progress.emit("ORB 特征匹配...", cur, tot),
             )
             offset = max((g.group_id for g in groups), default=gid_offset)
@@ -138,8 +176,9 @@ class ScanWorker(QObject):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, config: AppConfig | None = None):
         super().__init__()
+        self._config = config or AppConfig()
         self.setWindowTitle("ImageDedup — 图片查重工具")
         self.resize(1200, 800)
 
@@ -178,6 +217,8 @@ class MainWindow(QMainWindow):
         self._source_list = DropTreeWidget()
         self._source_list.setMinimumWidth(250)
         layout.addWidget(self._source_list, 1)
+        # Load previously extracted archives on startup
+        self._source_list.load_existing_extracted()
 
         # Buttons
         btn_layout = QHBoxLayout()
@@ -226,6 +267,10 @@ class MainWindow(QMainWindow):
         self._btn_report.setEnabled(False)
         self._btn_report.clicked.connect(self._on_generate_report)
         layout.addWidget(self._btn_report)
+
+        self._btn_settings = QPushButton("设置")
+        self._btn_settings.clicked.connect(self._on_settings)
+        layout.addWidget(self._btn_settings)
 
         return panel
 
@@ -288,7 +333,7 @@ class MainWindow(QMainWindow):
         self._results_view.clear()
 
         self._thread = QThread()
-        self._worker = ScanWorker(sources, options)
+        self._worker = ScanWorker(sources, options, self._config)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.progress.connect(self._on_progress)
@@ -313,7 +358,7 @@ class MainWindow(QMainWindow):
         else:
             self._progress_bar.setRange(0, 0)
 
-    def _on_scan_finished(self, groups: list[DuplicateGroup], scanner: Scanner):
+    def _on_scan_finished(self, groups: list[DuplicateGroup], scanner: Scanner, scan_errors: ScanErrors, delta_info):
         # Clean up previous scanner's temp files, keep new one alive
         if self._scanner is not None:
             self._scanner.cleanup()
@@ -325,7 +370,16 @@ class MainWindow(QMainWindow):
         self._btn_report.setEnabled(bool(groups))
 
         total_files = sum(len(g.files) for g in groups)
-        self._status.showMessage(f"扫描完成 — 发现 {len(groups)} 组重复，涉及 {total_files} 个文件")
+        msg = f"扫描完成 — 发现 {len(groups)} 组重复，涉及 {total_files} 个文件"
+        if delta_info:
+            msg += f" (新增 {delta_info['new']}, 修改 {delta_info['modified']}, 删除 {delta_info['deleted']})"
+        self._status.showMessage(msg)
+
+        if scan_errors and scan_errors.count > 0:
+            QMessageBox.warning(
+                self, "扫描警告",
+                f"扫描完成，但有 {scan_errors.count} 个文件处理失败。\n详情请查看日志文件。",
+            )
 
         if not groups:
             QMessageBox.information(self, "结果", "未发现重复图片")
@@ -337,12 +391,19 @@ class MainWindow(QMainWindow):
 
     # --- Forensic dialog ---
 
+    def _on_settings(self):
+        from .settings_dialog import SettingsDialog
+        dlg = SettingsDialog(self._config, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._config = dlg.config
+            self._threshold_slider.setValue(self._config.perceptual_threshold)
+
     def _on_group_double_clicked(self, group: DuplicateGroup):
-        dlg = ForensicDialog(group, self)
+        dlg = ForensicDialog(group, self, config=self._config)
         dlg.exec()
 
     def _on_file_double_clicked(self, file_path: str, group: DuplicateGroup):
-        dlg = ImageViewerDialog(file_path, group, self)
+        dlg = ImageViewerDialog(file_path, group, self, config=self._config)
         dlg.exec()
 
     def closeEvent(self, event):

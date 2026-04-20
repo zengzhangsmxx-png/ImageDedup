@@ -20,6 +20,10 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from ..logging_setup import get_logger
+
+logger = get_logger("widgets")
+
 
 def numpy_to_qpixmap(arr: np.ndarray) -> QPixmap:
     """Convert a numpy array (BGR or grayscale) to QPixmap."""
@@ -154,12 +158,26 @@ def _extract_archive(archive_path: Path, dest_dir: Path):
             shutil.copyfileobj(f_in, f_out)
 
 
+def _get_extract_base() -> Path:
+    """Get the extraction base directory, compatible with PyInstaller."""
+    # Use user's home directory to ensure persistence across runs
+    # and compatibility with PyInstaller (where __file__ points to temp dir)
+    base = Path.home() / ".cache" / "ImageDedup" / "extracted"
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+_EXTRACT_BASE = _get_extract_base()
+
+_LEVEL_LABELS = {0: "1级目录", 1: "2级目录", 2: "3级目录"}
+
+
 def _recursive_extract(archive_path: Path, dest_dir: Path):
     """Extract archive, then recursively extract any nested archives inside."""
     dest_dir.mkdir(parents=True, exist_ok=True)
     try:
         _extract_archive(archive_path, dest_dir)
-    except Exception:
+    except Exception as e:
+        logger.warning("Extract failed %s: %s", archive_path, e)
         return
 
     for f in list(dest_dir.rglob("*")):
@@ -254,24 +272,27 @@ class DropTreeWidget(QTreeWidget):
         parent_item.addChild(child)
 
     def add_archive(self, archive_path: Path):
-        """Extract archive to sibling directory, then add as tree node."""
-        dest_dir = archive_path.parent / archive_path.stem
+        """Extract archive to app cache directory, preserving folder hierarchy with level labels."""
+        _EXTRACT_BASE.mkdir(parents=True, exist_ok=True)
+        dest_dir = _EXTRACT_BASE / archive_path.stem
+        # Avoid collision if same name already extracted
+        if dest_dir.exists():
+            idx = 1
+            while (dest_dir.parent / f"{archive_path.stem}_{idx}").exists():
+                idx += 1
+            dest_dir = dest_dir.parent / f"{archive_path.stem}_{idx}"
+
         _recursive_extract(archive_path, dest_dir)
         self._extracted_dirs.append(dest_dir)
 
-        item = QTreeWidgetItem([archive_path.name, "压缩包", ""])
+        img_count = self._count_images(dest_dir)
+        item = QTreeWidgetItem([archive_path.name, "压缩包", f"{img_count} 张" if img_count else ""])
         item.setToolTip(0, str(dest_dir))
         item.setData(0, Qt.ItemDataRole.UserRole, str(dest_dir))
         item.setCheckState(0, Qt.CheckState.Checked)
 
-        sub_dirs = sorted([d for d in dest_dir.iterdir() if d.is_dir()])
-        img_count = self._count_images(dest_dir)
+        self._add_archive_children(item, dest_dir, level=0)
 
-        if sub_dirs:
-            for sd in sub_dirs:
-                self._add_subfolder(item, sd)
-
-        item.setText(2, f"{img_count} 张" if img_count else "")
         self.addTopLevelItem(item)
         item.setExpanded(True)
 
@@ -308,18 +329,67 @@ class DropTreeWidget(QTreeWidget):
         if item.checkState(0) == Qt.CheckState.Checked:
             path = item.data(0, Qt.ItemDataRole.UserRole)
             if path:
-                has_checked_children = False
+                # All checked → just return this path (Scanner rglobs subdirs)
+                all_children_checked = True
                 for i in range(item.childCount()):
-                    if item.child(i).checkState(0) == Qt.CheckState.Checked:
-                        has_checked_children = True
+                    if item.child(i).checkState(0) != Qt.CheckState.Checked:
+                        all_children_checked = False
                         break
-                if has_checked_children:
-                    self._collect_checked(item, paths)
-                else:
+                if item.childCount() == 0 or all_children_checked:
                     paths.append(path)
+                else:
+                    # Mixed state among children — recurse
+                    self._collect_checked(item, paths)
         elif item.checkState(0) == Qt.CheckState.PartiallyChecked:
             self._collect_checked(item, paths)
 
     @property
     def extracted_dirs(self) -> list[Path]:
         return self._extracted_dirs
+
+    def _add_archive_children(self, parent_item: QTreeWidgetItem, folder: Path, level: int):
+        """Recursively add sub-folders with level labels (1级/2级/3级目录)."""
+        _IMG_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".tif"}
+        sub_dirs = sorted([d for d in folder.iterdir() if d.is_dir()])
+        loose_imgs = [f for f in folder.iterdir()
+                      if f.is_file() and f.suffix.lower() in _IMG_EXTS]
+
+        for sd in sub_dirs:
+            img_count = self._count_images(sd)
+            level_label = _LEVEL_LABELS.get(level, f"{level + 1}级目录")
+            child = QTreeWidgetItem([sd.name, level_label, f"{img_count} 张" if img_count else ""])
+            child.setToolTip(0, str(sd))
+            child.setData(0, Qt.ItemDataRole.UserRole, str(sd))
+            child.setCheckState(0, Qt.CheckState.Checked)
+            parent_item.addChild(child)
+            self._add_archive_children(child, sd, level + 1)
+            if child.childCount() > 0:
+                child.setExpanded(True)
+
+        # Show loose image files as individual leaf nodes
+        for img in sorted(loose_imgs):
+            leaf = QTreeWidgetItem([img.name, "图片", ""])
+            leaf.setToolTip(0, str(img))
+            leaf.setData(0, Qt.ItemDataRole.UserRole, str(img))
+            leaf.setCheckState(0, Qt.CheckState.Checked)
+            parent_item.addChild(leaf)
+
+    def cleanup_extracted(self):
+        """No-op — extracted directories are permanently kept for the user."""
+        pass
+
+    def load_existing_extracted(self):
+        """On startup, load any previously extracted archive directories into the tree."""
+        if not _EXTRACT_BASE.exists():
+            return
+        for d in sorted(_EXTRACT_BASE.iterdir()):
+            if not d.is_dir():
+                continue
+            img_count = self._count_images(d)
+            item = QTreeWidgetItem([d.name, "已解压", f"{img_count} 张" if img_count else ""])
+            item.setToolTip(0, str(d))
+            item.setData(0, Qt.ItemDataRole.UserRole, str(d))
+            item.setCheckState(0, Qt.CheckState.Checked)
+            self._add_archive_children(item, d, level=0)
+            self.addTopLevelItem(item)
+            item.setExpanded(True)

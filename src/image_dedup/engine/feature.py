@@ -8,7 +8,10 @@ from typing import Callable
 import cv2
 import numpy as np
 
+from ..logging_setup import get_logger
 from .hasher import DuplicateGroup, ImageHashes
+
+logger = get_logger("feature")
 
 
 @dataclass
@@ -22,9 +25,10 @@ class FeatureMatch:
 
 
 class FeatureMatcher:
-    def __init__(self, n_features: int = 1000, ratio_threshold: float = 0.75):
+    def __init__(self, n_features: int = 1000, ratio_threshold: float = 0.75, max_dim: int = 1024):
         self._n_features = n_features
         self._ratio = ratio_threshold
+        self._max_dim = max_dim
 
     def compare_pair(self, img_a_path: str, img_b_path: str) -> FeatureMatch | None:
         try:
@@ -36,8 +40,8 @@ class FeatureMatcher:
             # Resize large images for speed
             for img in (img_a, img_b):
                 h, w = img.shape[:2]
-                if max(h, w) > 1024:
-                    scale = 1024 / max(h, w)
+                if max(h, w) > self._max_dim:
+                    scale = self._max_dim / max(h, w)
                     img = cv2.resize(img, None, fx=scale, fy=scale)
 
             orb = cv2.ORB_create(nFeatures=self._n_features)
@@ -71,7 +75,8 @@ class FeatureMatcher:
                 num_good_matches=len(good),
                 similarity_score=round(min(score, 1.0), 3),
             )
-        except Exception:
+        except Exception as e:
+            logger.debug("ORB compare failed %s vs %s: %s", img_a_path, img_b_path, e)
             return None
 
     def compare_candidates(
