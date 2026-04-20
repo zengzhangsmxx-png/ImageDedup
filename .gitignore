@@ -29,3 +29,4 @@ Thumbs.db
 # Test artifacts
 test_images/
 test_report.html
+ImageDedup/
