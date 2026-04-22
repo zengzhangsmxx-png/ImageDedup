@@ -56,7 +56,7 @@ class ArchiveScanWorker(QObject):
     """在 QThread 中逐个扫描压缩包队列。"""
 
     progress = pyqtSignal(str, int, int)          # archive_path, current, total
-    archive_finished = pyqtSignal(str, list, int)  # archive_path, groups, total_files
+    archive_finished = pyqtSignal(str, list, int, object)  # archive_path, groups, total_files, temp_handle
     all_finished = pyqtSignal()
     error = pyqtSignal(str)
 
@@ -77,8 +77,8 @@ class ArchiveScanWorker(QObject):
                 break
             try:
                 self.progress.emit(archive_path, idx + 1, total)
-                groups, total_files = scanner.scan_archive(archive_path)
-                self.archive_finished.emit(archive_path, groups, total_files)
+                groups, total_files, temp_handle = scanner.scan_archive(archive_path, keep_temp=True)
+                self.archive_finished.emit(archive_path, groups, total_files, temp_handle)
             except Exception as exc:
                 logger.exception("扫描压缩包失败: %s", archive_path)
                 self.error.emit(f"{Path(archive_path).name}: {exc}")
@@ -105,6 +105,7 @@ class ArchiveScanTab(QWidget):
 
         # archive_path -> (groups, total_files)
         self._results: dict[str, tuple[list[DuplicateGroup], int]] = {}
+        self._temp_handles: dict[str, object] = {}  # archive_path -> TemporaryDirectory
         self._current_archive: Optional[str] = None
 
         self._build_ui()
@@ -159,6 +160,8 @@ class ArchiveScanTab(QWidget):
         self._queue_tree.setColumnCount(3)
         self._queue_tree.setAlternatingRowColors(True)
         self._queue_tree.setRootIsDecorated(False)
+        self._queue_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._queue_tree.customContextMenuRequested.connect(self._on_queue_context_menu)
         header = self._queue_tree.header()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
@@ -215,6 +218,8 @@ class ArchiveScanTab(QWidget):
         self._result_tree.setAlternatingRowColors(True)
         self._result_tree.setRootIsDecorated(True)
         self._result_tree.setSelectionMode(QTreeWidget.SelectionMode.ExtendedSelection)
+        self._result_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._result_tree.customContextMenuRequested.connect(self._on_result_context_menu)
         rh = self._result_tree.header()
         rh.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         for col in (1, 2, 3):
@@ -226,6 +231,15 @@ class ArchiveScanTab(QWidget):
         self._progress = QProgressBar()
         self._progress.setVisible(False)
         right_layout.addWidget(self._progress)
+
+        # overall progress percentage
+        self._overall_progress_label = QLabel("整体进度: 0%")
+        self._overall_progress_label.setStyleSheet(
+            "color: #4CAF50; font-weight: bold; padding: 4px; font-size: 14px;"
+        )
+        self._overall_progress_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._overall_progress_label.setVisible(False)
+        right_layout.addWidget(self._overall_progress_label)
 
         # status label
         self._status = QLabel("就绪")
@@ -248,16 +262,17 @@ class ArchiveScanTab(QWidget):
         if not folder or not Path(folder).is_dir():
             QMessageBox.warning(self, "提示", "请先选择一个有效的文件夹路径")
             return
-        archives = self._scanner.get_today_new_archives(folder)
-        if not archives:
-            QMessageBox.information(self, "提示", "今日没有新增的压缩包")
+        items = self._scanner.get_today_new_archives(folder)
+        if not items:
+            QMessageBox.information(self, "提示", "今日没有新增的文件或文件夹")
             return
         added = 0
-        for arc in archives:
-            if not self._queue_contains(arc):
-                self._add_queue_item(arc)
+        for item in items:
+            item_str = str(item)
+            if not self._queue_contains(item_str):
+                self._add_queue_item(item_str)
                 added += 1
-        self._status.setText(f"已添加 {added} 个今日新增压缩包")
+        self._status.setText(f"已添加 {added} 个今日新增对象")
 
     def _on_add_archive(self):
         files, _ = QFileDialog.getOpenFileNames(
@@ -289,6 +304,72 @@ class ArchiveScanTab(QWidget):
                 paths.append(item.data(0, Qt.ItemDataRole.UserRole))
         return paths
 
+    # --------------------------------------------------------- queue context menu
+
+    def _on_queue_context_menu(self, pos):
+        item = self._queue_tree.itemAt(pos)
+        if not item:
+            return
+
+        archive_path = item.data(0, Qt.ItemDataRole.UserRole)
+        status = item.text(1)
+
+        menu = QMenu(self)
+
+        if status in ("完成", "完成 \u26a0") and archive_path in self._results:
+            save_action = menu.addAction("保存报告")
+            save_action.triggered.connect(lambda checked, p=archive_path: self._save_single_report(p))
+
+            delete_action = menu.addAction("删除任务")
+            delete_action.triggered.connect(lambda checked, p=archive_path: self._delete_queue_item(p))
+
+        remove_action = menu.addAction("从队列移除")
+        remove_action.triggered.connect(lambda checked, p=archive_path: self._remove_from_queue(p))
+
+        menu.exec(self._queue_tree.viewport().mapToGlobal(pos))
+
+    def _save_single_report(self, archive_path: str):
+        if archive_path not in self._results:
+            return
+        dest, _ = QFileDialog.getSaveFileName(
+            self, "保存报告",
+            str(Path(archive_path).stem + "_report.html"),
+            "HTML 报告 (*.html)",
+        )
+        if dest:
+            groups, total_files = self._results[archive_path]
+            self._write_report(dest, archive_path, groups, total_files)
+            self._status.setText(f"报告已保存: {dest}")
+
+    def _delete_queue_item(self, archive_path: str):
+        reply = QMessageBox.question(
+            self, "确认删除",
+            f"确定要删除任务 {Path(archive_path).name} 吗？\n扫描结果将被清除。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        if archive_path in self._results:
+            del self._results[archive_path]
+
+        self._cleanup_temp(archive_path)
+        self._remove_from_queue(archive_path)
+
+        if self._current_archive == archive_path:
+            self._current_archive = None
+            self._result_tree.clear()
+
+        self._status.setText(f"已删除任务: {Path(archive_path).name}")
+
+    def _remove_from_queue(self, archive_path: str):
+        for i in range(self._queue_tree.topLevelItemCount()):
+            item = self._queue_tree.topLevelItem(i)
+            if item.data(0, Qt.ItemDataRole.UserRole) == archive_path:
+                self._queue_tree.takeTopLevelItem(i)
+                break
+
     # --------------------------------------------------------- scanning
 
     def _on_scan_all(self):
@@ -302,6 +383,8 @@ class ArchiveScanTab(QWidget):
         self._progress.setVisible(True)
         self._progress.setRange(0, len(queue))
         self._progress.setValue(0)
+        self._overall_progress_label.setVisible(True)
+        self._overall_progress_label.setText("整体进度: 0%")
 
         self._thread = QThread()
         self._worker = ArchiveScanWorker(queue, self._config)
@@ -325,14 +408,20 @@ class ArchiveScanTab(QWidget):
         self._btn_scan_all.setEnabled(True)
         self._btn_stop.setEnabled(False)
         self._progress.setVisible(False)
+        self._overall_progress_label.setVisible(False)
         if self._thread and self._thread.isRunning():
             self._thread.quit()
-            self._thread.wait(3000)
+            if not self._thread.wait(5000):
+                logger.warning("Archive scan thread did not quit in time, terminating")
+                self._thread.terminate()
+                self._thread.wait()
         self._thread = None
         self._worker = None
 
     def _on_worker_progress(self, archive_path: str, current: int, total: int):
         self._progress.setValue(current)
+        pct = int((current / total) * 100) if total > 0 else 0
+        self._overall_progress_label.setText(f"整体进度: {pct}%")
         self._status.setText(f"正在扫描 ({current}/{total}): {Path(archive_path).name}")
         # mark queue item
         for i in range(self._queue_tree.topLevelItemCount()):
@@ -341,8 +430,10 @@ class ArchiveScanTab(QWidget):
                 item.setText(1, "扫描中...")
                 break
 
-    def _on_archive_scanned(self, archive_path: str, groups: list, total_files: int):
+    def _on_archive_scanned(self, archive_path: str, groups: list, total_files: int, temp_handle: object):
         self._results[archive_path] = (groups, total_files)
+        if temp_handle is not None:
+            self._temp_handles[archive_path] = temp_handle
         high = self._check_high_similarity(groups, total_files)
 
         # update queue item
@@ -372,6 +463,38 @@ class ArchiveScanTab(QWidget):
     def _on_worker_error(self, msg: str):
         logger.error("扫描错误: %s", msg)
         self._status.setText(f"错误: {msg}")
+
+    def stop_and_cleanup(self):
+        """停止扫描并清理资源，由 MainWindow 关闭时调用。"""
+        if self._worker:
+            self._worker.stop()
+        if self._thread and self._thread.isRunning():
+            self._thread.quit()
+            if not self._thread.wait(5000):
+                logger.warning("Archive scan thread did not stop gracefully, terminating")
+                self._thread.terminate()
+                self._thread.wait()
+        self._thread = None
+        self._worker = None
+        self._cleanup_all_temps()
+
+    def _cleanup_temp(self, archive_path: str):
+        """清理单个压缩包的临时目录。"""
+        handle = self._temp_handles.pop(archive_path, None)
+        if handle is not None:
+            try:
+                handle.cleanup()
+            except Exception as e:
+                logger.debug("临时目录清理失败: %s", e)
+
+    def _cleanup_all_temps(self):
+        """清理所有临时目录。"""
+        for handle in self._temp_handles.values():
+            try:
+                handle.cleanup()
+            except Exception as e:
+                logger.debug("临时目录清理失败: %s", e)
+        self._temp_handles.clear()
 
     # --------------------------------------------------------- results
 
@@ -456,6 +579,55 @@ class ArchiveScanTab(QWidget):
             file_path = item.toolTip(0)
             if file_path:
                 self.file_double_clicked.emit(file_path, group)
+
+    def _on_result_context_menu(self, pos):
+        item = self._result_tree.itemAt(pos)
+        if not item or item.parent() is None:
+            return
+        file_path = item.toolTip(0)
+        if not file_path:
+            return
+
+        menu = QMenu(self)
+        delete_action = menu.addAction("删除此图片")
+        delete_action.triggered.connect(lambda checked, fp=file_path, it=item: self._delete_single_file(fp, it))
+        menu.exec(self._result_tree.viewport().mapToGlobal(pos))
+
+    def _delete_single_file(self, file_path: str, item: QTreeWidgetItem):
+        reply = QMessageBox.question(
+            self, "确认删除",
+            f"确定要删除 {Path(file_path).name} 吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            Path(file_path).unlink(missing_ok=True)
+        except Exception as exc:
+            QMessageBox.critical(self, "删除失败", f"无法删除文件:\n{exc}")
+            return
+
+        if not self._current_archive or self._current_archive not in self._results:
+            return
+
+        groups, total_files = self._results[self._current_archive]
+        for g in groups:
+            g.files = [f for f in g.files if f.file_path != file_path]
+        groups = [g for g in groups if len(g.files) >= 2]
+        self._results[self._current_archive] = (groups, max(0, total_files - 1))
+        self._populate_results(groups)
+
+        # update queue item duplicate count
+        dup_count = sum(len(g.files) for g in groups)
+        for i in range(self._queue_tree.topLevelItemCount()):
+            qi = self._queue_tree.topLevelItem(i)
+            if qi.data(0, Qt.ItemDataRole.UserRole) == self._current_archive:
+                qi.setText(2, str(dup_count) if dup_count else "0")
+                break
+
+        self._status.setText(f"已删除: {Path(file_path).name}")
 
     # --------------------------------------------------------- toolbar actions
 

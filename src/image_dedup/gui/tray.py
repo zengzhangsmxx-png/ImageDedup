@@ -127,3 +127,22 @@ class SystemTrayManager(QObject):
         if self._scan_paths:
             logger.info("定时扫描触发")
             self.scan_requested.emit(self._scan_paths)
+
+    def cleanup(self):
+        """清理托盘管理器资源。"""
+        if self._scan_timer is not None:
+            self._scan_timer.stop()
+            self._scan_timer = None
+
+        if self._watcher is not None:
+            dirs = self._watcher.directories()
+            if dirs:
+                self._watcher.removePaths(dirs)
+            self._watcher = None
+
+        if self._tray is not None:
+            self._tray.hide()
+            self._tray.deleteLater()
+            self._tray = None
+
+        logger.info("托盘管理器已清理")

@@ -240,6 +240,7 @@ class DropTreeWidget(QTreeWidget):
         self.setAlternatingRowColors(True)
         self._extracted_dirs: list[Path] = []
         self._config = config
+        self._active_workers: list[ExtractionWorker] = []
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
@@ -330,9 +331,12 @@ class DropTreeWidget(QTreeWidget):
 
         # Create worker thread
         worker = ExtractionWorker(archive_path, dest_dir)
+        self._active_workers.append(worker)
 
         def on_finished(extracted_dir: Path):
             progress_dialog.accept()
+            if worker in self._active_workers:
+                self._active_workers.remove(worker)
             self._extracted_dirs.append(extracted_dir)
 
             img_count = self._count_images(extracted_dir)
@@ -348,11 +352,15 @@ class DropTreeWidget(QTreeWidget):
 
         def on_error(error_msg: str):
             progress_dialog.reject()
+            if worker in self._active_workers:
+                self._active_workers.remove(worker)
             logger.error(f"Extraction failed: {error_msg}")
 
         def on_cancel():
             worker.cancel()
             worker.wait()
+            if worker in self._active_workers:
+                self._active_workers.remove(worker)
             # Clean up partial extraction
             if dest_dir.exists():
                 try:
@@ -466,3 +474,15 @@ class DropTreeWidget(QTreeWidget):
             self._add_archive_children(item, d, level=0)
             self.addTopLevelItem(item)
             item.setExpanded(True)
+
+    def cleanup_workers(self):
+        """停止并等待所有活动的解压工作线程。"""
+        for worker in self._active_workers[:]:
+            if worker.isRunning():
+                logger.info("正在停止解压工作线程...")
+                worker.cancel()
+                if not worker.wait(3000):
+                    logger.warning("解压工作线程未能停止，强制终止")
+                    worker.terminate()
+                    worker.wait()
+        self._active_workers.clear()

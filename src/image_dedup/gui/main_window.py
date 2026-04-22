@@ -574,13 +574,38 @@ class MainWindow(QMainWindow):
         dlg.exec()
 
     def closeEvent(self, event):
+        """清理所有资源后关闭。"""
         if self._config.minimize_to_tray:
             event.ignore()
             self.hide()
             return
+
+        # 停止主扫描线程
+        if self._thread and self._thread.isRunning():
+            logger.info("正在停止主扫描线程...")
+            self._thread.quit()
+            if not self._thread.wait(5000):
+                logger.warning("主扫描线程未能优雅停止，强制终止")
+                self._thread.terminate()
+                self._thread.wait()
+
+        # 停止压缩包扫描线程
+        if hasattr(self, '_archive_tab'):
+            self._archive_tab.stop_and_cleanup()
+
+        # 清理提取工作线程
+        if hasattr(self, '_source_list'):
+            self._source_list.cleanup_workers()
+
+        # 清理扫描器临时文件
         if self._scanner is not None:
             self._scanner.cleanup()
             self._scanner = None
+
+        # 清理托盘管理器
+        if hasattr(self, '_tray_manager'):
+            self._tray_manager.cleanup()
+
         super().closeEvent(event)
 
     # --- Reports ---

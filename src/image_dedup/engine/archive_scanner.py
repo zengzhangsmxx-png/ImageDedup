@@ -30,68 +30,59 @@ class ArchiveScanner:
         self,
         archive_path: str | Path,
         config: AppConfig | None = None,
-    ) -> tuple[list[DuplicateGroup], int]:
-        """扫描压缩包内的图片，返回 (重复组列表, 文件总数)。
+        keep_temp: bool = False,
+    ) -> tuple[list[DuplicateGroup], int] | tuple[list[DuplicateGroup], int, tempfile.TemporaryDirectory]:
+        """扫描压缩包/文档/文件夹内的图片。
 
-        解压到临时目录，计算哈希并查找精确+感知重复，完成后自动清理。
+        支持：压缩包(.zip/.rar/.7z等)、文档(.xlsx/.xls/.pdf)、文件夹
+        keep_temp=False: 返回 (重复组列表, 文件总数)，自动清理临时目录。
+        keep_temp=True: 返回 (重复组列表, 文件总数, 临时目录句柄)，调用方负责清理。
         """
         archive_path = Path(archive_path)
         cfg = config or self._config
 
+        if archive_path.is_dir():
+            return self._scan_directory(archive_path, cfg, keep_temp)
+
         if not archive_path.is_file():
-            logger.error("压缩包不存在: %s", archive_path)
-            return [], 0
+            logger.error("文件不存在: %s", archive_path)
+            return ([], 0, None) if keep_temp else ([], 0)
+
+        # 文档格式直接交给 Scanner 处理（它支持 xlsx/pdf）
+        DOCUMENT_FORMATS = {".xlsx", ".xls", ".pdf"}
+        if archive_path.suffix.lower() in DOCUMENT_FORMATS:
+            return self._scan_document(archive_path, cfg, keep_temp)
 
         extracted_dir, temp_handle = self._temp_extract(archive_path)
         try:
-            # 扫描解压目录中的图片
             scanner = Scanner()
             try:
                 image_files = scanner.scan([extracted_dir])
             finally:
                 scanner.cleanup()
 
-            total_count = len(image_files)
+            all_groups, total_count = self._scan_dedup(image_files, cfg, archive_path.name)
+
             if total_count == 0:
-                logger.info("压缩包内未找到图片: %s", archive_path)
-                return [], 0
+                if not keep_temp:
+                    temp_handle.cleanup()
+                return ([], 0, temp_handle) if keep_temp else ([], 0)
 
-            logger.info("压缩包 %s 中发现 %d 张图片，开始计算哈希", archive_path.name, total_count)
+            if not keep_temp:
+                try:
+                    temp_handle.cleanup()
+                except Exception as e:
+                    logger.debug("临时目录清理失败: %s", e)
+                return all_groups, total_count
 
-            # 计算哈希
-            cache = HashCache()
-            engine = HashEngine(cache, config=cfg)
-            hashes = engine.compute_hashes(image_files)
+            return all_groups, total_count, temp_handle
 
-            if not hashes:
-                return [], total_count
-
-            # 查找精确重复
-            exact_groups = engine.find_exact_duplicates(hashes)
-            # 查找感知重复（排除已精确匹配的）
-            perceptual_groups = engine.find_perceptual_duplicates(
-                hashes,
-                threshold=cfg.perceptual_threshold,
-                exclude_exact=True,
-            )
-
-            all_groups = exact_groups + perceptual_groups
-
-            # 重新编号 group_id
-            for idx, group in enumerate(all_groups, start=1):
-                group.group_id = idx
-
-            logger.info(
-                "压缩包 %s 扫描完成: %d 张图片, %d 组重复",
-                archive_path.name, total_count, len(all_groups),
-            )
-            return all_groups, total_count
-
-        finally:
+        except Exception:
             try:
                 temp_handle.cleanup()
             except Exception as e:
                 logger.debug("临时目录清理失败: %s", e)
+            raise
 
     def remove_files_from_archive(
         self,
@@ -123,23 +114,105 @@ class ArchiveScanner:
         return dest_path
 
     def get_today_new_archives(self, folder_path: Path) -> list[Path]:
-        """返回指定文件夹中今天修改过的压缩包列表。"""
+        """返回指定文件夹中今天修改过的压缩包、文档和子文件夹列表。
+
+        递归扫描所有子文件夹，收集今日新增/修改的对象。
+        支持：压缩包、.xlsx/.xls/.pdf 文档、今日修改的子文件夹。
+        """
         folder_path = Path(folder_path)
         if not folder_path.is_dir():
             logger.warning("文件夹不存在: %s", folder_path)
             return []
 
         today = date.today()
-        archives: list[Path] = []
+        results: list[Path] = []
+        DOCUMENT_FORMATS = {".xlsx", ".xls", ".pdf"}
 
-        for f in sorted(folder_path.iterdir()):
-            if f.is_file() and f.suffix.lower() in ARCHIVE_FORMATS:
-                mtime = date.fromtimestamp(f.stat().st_mtime)
-                if mtime == today:
-                    archives.append(f)
+        def scan_recursive(path: Path):
+            """递归扫描目录，收集今日新增的文件和文件夹。"""
+            try:
+                for item in sorted(path.iterdir()):
+                    try:
+                        if item.is_file():
+                            # 检查压缩包和文档
+                            if item.suffix.lower() in ARCHIVE_FORMATS or item.suffix.lower() in DOCUMENT_FORMATS:
+                                mtime = date.fromtimestamp(item.stat().st_mtime)
+                                if mtime == today:
+                                    results.append(item)
+                        elif item.is_dir():
+                            # 检查文件夹修改时间
+                            mtime = date.fromtimestamp(item.stat().st_mtime)
+                            if mtime == today:
+                                results.append(item)
+                            # 递归扫描子文件夹
+                            scan_recursive(item)
+                    except (PermissionError, OSError):
+                        # 静默跳过无权限访问的文件/文件夹
+                        pass
+                    except Exception:
+                        # 静默跳过其他错误
+                        pass
+            except (PermissionError, OSError):
+                # 静默跳过无权限访问的目录
+                pass
+            except Exception:
+                # 静默跳过其他错误
+                pass
 
-        logger.info("今日新增/修改的压缩包: %d 个", len(archives))
-        return archives
+        scan_recursive(folder_path)
+        logger.info("今日新增/修改的对象: %d 个", len(results))
+        return results
+
+    def _scan_dedup(self, image_files, cfg, source_name: str):
+        """通用查重流程：计算哈希 → 精确匹配 → 感知匹配。"""
+        total_count = len(image_files)
+        if total_count == 0:
+            return [], 0
+
+        logger.info("%s 中发现 %d 张图片，开始计算哈希", source_name, total_count)
+
+        cache = HashCache()
+        engine = HashEngine(cache, config=cfg)
+        hashes = engine.compute_hashes(image_files)
+
+        if not hashes:
+            return [], total_count
+
+        exact_groups = engine.find_exact_duplicates(hashes)
+        perceptual_groups = engine.find_perceptual_duplicates(
+            hashes,
+            threshold=cfg.perceptual_threshold,
+            exclude_exact=True,
+        )
+
+        all_groups = exact_groups + perceptual_groups
+        for idx, group in enumerate(all_groups, start=1):
+            group.group_id = idx
+
+        logger.info("%s 扫描完成: %d 张图片, %d 组重复", source_name, total_count, len(all_groups))
+        return all_groups, total_count
+
+    def _scan_directory(self, dir_path: Path, cfg, keep_temp: bool):
+        """扫描文件夹内的图片查重。"""
+        scanner = Scanner()
+        try:
+            image_files = scanner.scan([dir_path])
+        finally:
+            scanner.cleanup()
+
+        all_groups, total_count = self._scan_dedup(image_files, cfg, dir_path.name)
+        return (all_groups, total_count, None) if keep_temp else (all_groups, total_count)
+
+    def _scan_document(self, doc_path: Path, cfg, keep_temp: bool):
+        """扫描文档（xlsx/pdf）内的图片查重。"""
+        scanner = Scanner()
+        try:
+            image_files = scanner.scan([doc_path])
+        finally:
+            scanner.cleanup()
+
+        all_groups, total_count = self._scan_dedup(image_files, cfg, doc_path.name)
+        return (all_groups, total_count, None) if keep_temp else (all_groups, total_count)
 
     def _temp_extract(
         self,
