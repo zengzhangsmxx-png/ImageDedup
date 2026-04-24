@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import os
+import subprocess
 from pathlib import Path
 from typing import Optional
 
 from PyQt6.QtCore import QObject, QThread, Qt, pyqtSignal
 from PyQt6.QtGui import QIcon, QPixmap
 from PyQt6.QtWidgets import (
+    QApplication,
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
@@ -79,6 +81,12 @@ class ArchiveScanWorker(QObject):
                 self.progress.emit(archive_path, idx + 1, total)
                 groups, total_files, temp_handle = scanner.scan_archive(archive_path, keep_temp=True)
                 self.archive_finished.emit(archive_path, groups, total_files, temp_handle)
+            except MemoryError:
+                logger.error("内存不足，跳过压缩包: %s", archive_path)
+                self.error.emit(f"{Path(archive_path).name}: 内存不足，文件过大无法处理")
+                # 强制触发垃圾回收，尝试释放内存
+                import gc
+                gc.collect()
             except Exception as exc:
                 logger.exception("扫描压缩包失败: %s", archive_path)
                 self.error.emit(f"{Path(archive_path).name}: {exc}")
@@ -589,9 +597,35 @@ class ArchiveScanTab(QWidget):
             return
 
         menu = QMenu(self)
-        delete_action = menu.addAction("删除此图片")
-        delete_action.triggered.connect(lambda checked, fp=file_path, it=item: self._delete_single_file(fp, it))
-        menu.exec(self._result_tree.viewport().mapToGlobal(pos))
+
+        # 文件定位菜单项
+        action_reveal = menu.addAction("在 Finder 中显示")
+        action_open = menu.addAction("打开文件")
+        action_copy_path = menu.addAction("复制文件路径")
+
+        # 如果当前有压缩包上下文，添加定位压缩包选项
+        if self._current_archive:
+            action_reveal_archive = menu.addAction("打开压缩包所在文件夹")
+        else:
+            action_reveal_archive = None
+
+        menu.addSeparator()
+        action_delete = menu.addAction("删除此图片")
+
+        chosen = menu.exec(self._result_tree.viewport().mapToGlobal(pos))
+        if chosen is None:
+            return
+
+        if chosen == action_reveal:
+            self._reveal_in_finder(file_path)
+        elif chosen == action_open:
+            self._open_file(file_path)
+        elif chosen == action_copy_path:
+            self._copy_path_to_clipboard(file_path)
+        elif action_reveal_archive and chosen == action_reveal_archive:
+            self._reveal_in_finder(self._current_archive)
+        elif chosen == action_delete:
+            self._delete_single_file(file_path, item)
 
     def _delete_single_file(self, file_path: str, item: QTreeWidgetItem):
         reply = QMessageBox.question(
@@ -628,6 +662,31 @@ class ArchiveScanTab(QWidget):
                 break
 
         self._status.setText(f"已删除: {Path(file_path).name}")
+
+    # --- File location helpers ---
+
+    @staticmethod
+    def _reveal_in_finder(file_path: str):
+        """在 Finder 中显示并选中文件。"""
+        try:
+            subprocess.Popen(["open", "-R", file_path])
+        except Exception as e:
+            QMessageBox.warning(None, "打开失败", f"无法在 Finder 中显示文件:\n{e}")
+
+    @staticmethod
+    def _open_file(file_path: str):
+        """使用系统默认程序打开文件。"""
+        try:
+            subprocess.Popen(["open", file_path])
+        except Exception as e:
+            QMessageBox.warning(None, "打开失败", f"无法打开文件:\n{e}")
+
+    @staticmethod
+    def _copy_path_to_clipboard(file_path: str):
+        """复制文件路径到剪贴板。"""
+        clipboard = QApplication.clipboard()
+        if clipboard:
+            clipboard.setText(file_path)
 
     # --------------------------------------------------------- toolbar actions
 

@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QIcon, QPixmap
 from PyQt6.QtWidgets import (
+    QApplication,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -298,14 +300,57 @@ class ResultsView(QWidget):
                     self._sync_group_data(fi)
                     self._remove_item_from_tree(fi)
         elif item.parent() is not None:
+            file_path = item.toolTip(0)
+
+            # 文件定位菜单项
+            if file_path:
+                action_reveal = menu.addAction("在 Finder 中显示")
+                action_open = menu.addAction("打开文件")
+                action_copy_path = menu.addAction("复制文件路径")
+                menu.addSeparator()
+
             action_remove = menu.addAction("从结果中移除")
             action_delete = menu.addAction("删除文件（不可恢复）")
             chosen = menu.exec(self._tree.viewport().mapToGlobal(pos))
-            if chosen == action_remove:
+
+            if chosen is None:
+                return
+            if file_path and chosen == action_reveal:
+                self._reveal_in_finder(file_path)
+            elif file_path and chosen == action_open:
+                self._open_file(file_path)
+            elif file_path and chosen == action_copy_path:
+                self._copy_path_to_clipboard(file_path)
+            elif chosen == action_remove:
                 self._sync_group_data(item)
                 self._remove_item_from_tree(item)
             elif chosen == action_delete:
                 self._delete_file_from_disk(item)
+
+    # --- File location helpers ---
+
+    @staticmethod
+    def _reveal_in_finder(file_path: str):
+        """在 Finder 中显示并选中文件。"""
+        try:
+            subprocess.Popen(["open", "-R", file_path])
+        except Exception as e:
+            QMessageBox.warning(None, "打开失败", f"无法在 Finder 中显示文件:\n{e}")
+
+    @staticmethod
+    def _open_file(file_path: str):
+        """使用系统默认程序打开文件。"""
+        try:
+            subprocess.Popen(["open", file_path])
+        except Exception as e:
+            QMessageBox.warning(None, "打开失败", f"无法打开文件:\n{e}")
+
+    @staticmethod
+    def _copy_path_to_clipboard(file_path: str):
+        """复制文件路径到剪贴板。"""
+        clipboard = QApplication.clipboard()
+        if clipboard:
+            clipboard.setText(file_path)
 
     def _sync_group_data(self, item: QTreeWidgetItem):
         file_path = item.toolTip(0)

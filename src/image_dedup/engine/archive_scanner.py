@@ -37,51 +37,98 @@ class ArchiveScanner:
         支持：压缩包(.zip/.rar/.7z等)、文档(.xlsx/.xls/.pdf)、文件夹
         keep_temp=False: 返回 (重复组列表, 文件总数)，自动清理临时目录。
         keep_temp=True: 返回 (重复组列表, 文件总数, 临时目录句柄)，调用方负责清理。
+
+        内存保护：大文件分批处理，单个文件失败不影响整体扫描。
         """
         archive_path = Path(archive_path)
         cfg = config or self._config
 
-        if archive_path.is_dir():
-            return self._scan_directory(archive_path, cfg, keep_temp)
-
-        if not archive_path.is_file():
-            logger.error("文件不存在: %s", archive_path)
-            return ([], 0, None) if keep_temp else ([], 0)
-
-        # 文档格式直接交给 Scanner 处理（它支持 xlsx/pdf）
-        DOCUMENT_FORMATS = {".xlsx", ".xls", ".pdf"}
-        if archive_path.suffix.lower() in DOCUMENT_FORMATS:
-            return self._scan_document(archive_path, cfg, keep_temp)
-
-        extracted_dir, temp_handle = self._temp_extract(archive_path)
         try:
-            scanner = Scanner()
+            if archive_path.is_dir():
+                return self._scan_directory(archive_path, cfg, keep_temp)
+
+            if not archive_path.is_file():
+                logger.error("文件不存在: %s", archive_path)
+                return ([], 0, None) if keep_temp else ([], 0)
+
+            # 文档格式直接交给 Scanner 处理（它支持 xlsx/pdf）
+            DOCUMENT_FORMATS = {".xlsx", ".xls", ".pdf"}
+            if archive_path.suffix.lower() in DOCUMENT_FORMATS:
+                return self._scan_document(archive_path, cfg, keep_temp)
+
+            extracted_dir, temp_handle = self._temp_extract(archive_path)
             try:
-                image_files = scanner.scan([extracted_dir])
-            finally:
-                scanner.cleanup()
+                scanner = Scanner()
+                try:
+                    image_files = scanner.scan([extracted_dir])
+                finally:
+                    scanner.cleanup()
 
-            all_groups, total_count = self._scan_dedup(image_files, cfg, archive_path.name)
+                # 分批处理图片，避免一次性加载过多到内存
+                BATCH_SIZE = 5000
+                all_groups: list[DuplicateGroup] = []
+                total_count = len(image_files)
 
-            if total_count == 0:
+                if total_count == 0:
+                    if not keep_temp:
+                        temp_handle.cleanup()
+                    return ([], 0, temp_handle) if keep_temp else ([], 0)
+
+                if total_count <= BATCH_SIZE:
+                    # 小批量直接处理
+                    all_groups, total_count = self._scan_dedup(image_files, cfg, archive_path.name)
+                else:
+                    # 大批量分批处理
+                    logger.info("文件数量较多 (%d)，分批处理 (每批 %d)", total_count, BATCH_SIZE)
+                    gid_offset = 0
+                    for batch_start in range(0, total_count, BATCH_SIZE):
+                        batch_end = min(batch_start + BATCH_SIZE, total_count)
+                        batch_files = image_files[batch_start:batch_end]
+                        try:
+                            batch_groups, _ = self._scan_dedup(
+                                batch_files, cfg,
+                                f"{archive_path.name} (批次 {batch_start//BATCH_SIZE + 1})",
+                            )
+                            for g in batch_groups:
+                                g.group_id += gid_offset
+                            all_groups.extend(batch_groups)
+                            gid_offset = max((g.group_id for g in all_groups), default=0)
+                        except MemoryError:
+                            logger.error("内存不足，停止处理后续批次 (已处理 %d/%d)",
+                                       batch_start, total_count)
+                            break
+                        except Exception as e:
+                            logger.warning("批次处理失败 (%d-%d): %s", batch_start, batch_end, e)
+                            continue
+
                 if not keep_temp:
-                    temp_handle.cleanup()
-                return ([], 0, temp_handle) if keep_temp else ([], 0)
+                    try:
+                        temp_handle.cleanup()
+                    except Exception as e:
+                        logger.debug("临时目录清理失败: %s", e)
+                    return all_groups, total_count
 
-            if not keep_temp:
+                return all_groups, total_count, temp_handle
+
+            except MemoryError:
+                logger.error("内存不足，无法完成扫描: %s", archive_path)
+                try:
+                    temp_handle.cleanup()
+                except Exception:
+                    pass
+                return ([], 0, None) if keep_temp else ([], 0)
+            except Exception:
                 try:
                     temp_handle.cleanup()
                 except Exception as e:
                     logger.debug("临时目录清理失败: %s", e)
-                return all_groups, total_count
+                raise
 
-            return all_groups, total_count, temp_handle
-
-        except Exception:
-            try:
-                temp_handle.cleanup()
-            except Exception as e:
-                logger.debug("临时目录清理失败: %s", e)
+        except MemoryError:
+            logger.error("内存不足，扫描中止: %s", archive_path)
+            return ([], 0, None) if keep_temp else ([], 0)
+        except Exception as e:
+            logger.exception("扫描压缩包异常: %s", archive_path)
             raise
 
     def remove_files_from_archive(
@@ -221,41 +268,146 @@ class ArchiveScanner:
         """解压压缩包到临时目录，返回 (解压目录, 临时目录句柄)。
 
         支持 ZIP / RAR / 7z / tar / gz / bz2 / tgz。
+        添加内存保护：大文件分批处理，避免一次性加载过多数据。
         """
         archive_path = Path(archive_path)
         suffix = archive_path.suffix.lower()
         temp_dir = tempfile.TemporaryDirectory(prefix="imgdedup_archive_")
         extracted = Path(temp_dir.name)
 
+        # 文件大小限制（单位：字节）
+        MAX_SINGLE_FILE_SIZE = 1 * 1024 * 1024 * 1024  # 1GB
+        MAX_TOTAL_EXTRACT_SIZE = 30 * 1024 * 1024 * 1024  # 30GB
+
+        total_extracted = 0
+        skipped_files = []
+
         try:
             if suffix == ".zip":
                 with zipfile.ZipFile(archive_path, "r") as zf:
-                    zf.extractall(extracted)
+                    members = zf.infolist()
+                    for member in members:
+                        try:
+                            # 跳过目录
+                            if member.is_dir():
+                                continue
+
+                            # 检查单个文件大小
+                            if member.file_size > MAX_SINGLE_FILE_SIZE:
+                                logger.warning("跳过过大文件 (%.1f MB): %s",
+                                             member.file_size / (1024*1024), member.filename)
+                                skipped_files.append(member.filename)
+                                continue
+
+                            # 检查总解压大小
+                            if total_extracted + member.file_size > MAX_TOTAL_EXTRACT_SIZE:
+                                logger.warning("达到解压大小限制 (%.1f GB)，停止解压",
+                                             MAX_TOTAL_EXTRACT_SIZE / (1024*1024*1024))
+                                break
+
+                            # 逐个解压文件
+                            zf.extract(member, extracted)
+                            total_extracted += member.file_size
+
+                        except Exception as e:
+                            logger.warning("解压文件失败 %s: %s", member.filename, e)
+                            continue
 
             elif suffix == ".rar":
                 import rarfile
                 with rarfile.RarFile(str(archive_path), "r") as rf:
-                    rf.extractall(str(extracted))
+                    members = rf.infolist()
+                    for member in members:
+                        try:
+                            if member.isdir():
+                                continue
+
+                            if member.file_size > MAX_SINGLE_FILE_SIZE:
+                                logger.warning("跳过过大文件 (%.1f MB): %s",
+                                             member.file_size / (1024*1024), member.filename)
+                                skipped_files.append(member.filename)
+                                continue
+
+                            if total_extracted + member.file_size > MAX_TOTAL_EXTRACT_SIZE:
+                                logger.warning("达到解压大小限制，停止解压")
+                                break
+
+                            rf.extract(member, str(extracted))
+                            total_extracted += member.file_size
+
+                        except Exception as e:
+                            logger.warning("解压文件失败 %s: %s", member.filename, e)
+                            continue
 
             elif suffix == ".7z":
                 import py7zr
                 with py7zr.SevenZipFile(str(archive_path), mode="r") as sz:
-                    sz.extractall(path=str(extracted))
+                    all_files = sz.getnames()
+                    for filename in all_files:
+                        try:
+                            # 7z 需要先读取文件信息
+                            file_info = sz.list()
+                            matching = [f for f in file_info if f.filename == filename]
+                            if not matching or matching[0].is_directory:
+                                continue
+
+                            file_size = matching[0].uncompressed
+                            if file_size > MAX_SINGLE_FILE_SIZE:
+                                logger.warning("跳过过大文件 (%.1f MB): %s",
+                                             file_size / (1024*1024), filename)
+                                skipped_files.append(filename)
+                                continue
+
+                            if total_extracted + file_size > MAX_TOTAL_EXTRACT_SIZE:
+                                logger.warning("达到解压大小限制，停止解压")
+                                break
+
+                            sz.extract(path=str(extracted), targets=[filename])
+                            total_extracted += file_size
+
+                        except Exception as e:
+                            logger.warning("解压文件失败 %s: %s", filename, e)
+                            continue
 
             elif suffix in (".tar", ".gz", ".bz2", ".tgz"):
                 import tarfile
                 with tarfile.open(str(archive_path), "r:*") as tf:
-                    tf.extractall(path=str(extracted), filter="data")
+                    members = tf.getmembers()
+                    for member in members:
+                        try:
+                            if member.isdir():
+                                continue
+
+                            if member.size > MAX_SINGLE_FILE_SIZE:
+                                logger.warning("跳过过大文件 (%.1f MB): %s",
+                                             member.size / (1024*1024), member.name)
+                                skipped_files.append(member.name)
+                                continue
+
+                            if total_extracted + member.size > MAX_TOTAL_EXTRACT_SIZE:
+                                logger.warning("达到解压大小限制，停止解压")
+                                break
+
+                            tf.extract(member, path=str(extracted), filter="data")
+                            total_extracted += member.size
+
+                        except Exception as e:
+                            logger.warning("解压文件失败 %s: %s", member.name, e)
+                            continue
 
             else:
                 logger.warning("不支持的压缩格式: %s", suffix)
+
+            if skipped_files:
+                logger.info("跳过 %d 个过大文件", len(skipped_files))
 
         except Exception as e:
             logger.error("解压失败 %s: %s", archive_path, e)
             # 即使解压失败也返回句柄，让调用方统一清理
             raise
 
-        logger.debug("已解压 %s → %s", archive_path.name, extracted)
+        logger.debug("已解压 %s → %s (%.1f MB)",
+                    archive_path.name, extracted, total_extracted / (1024*1024))
         return extracted, temp_dir
 
     # ------------------------------------------------------------------
