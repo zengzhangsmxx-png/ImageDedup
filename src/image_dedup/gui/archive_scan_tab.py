@@ -72,6 +72,24 @@ class ArchiveScanWorker(QObject):
         self._stopped = True
 
     def run(self):
+        try:
+            self._run_inner()
+        except MemoryError:
+            import gc
+            gc.collect()
+            logger.critical("ArchiveScanWorker: 内存不足，扫描中止")
+            try:
+                self.error.emit("内存不足，扫描已中止")
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.exception("ArchiveScanWorker: 未预期异常")
+            try:
+                self.error.emit(f"扫描异常: {exc}")
+            except Exception:
+                pass
+
+    def _run_inner(self):
         scanner = ArchiveScanner(self._config)
         total = len(self._queue)
         for idx, archive_path in enumerate(self._queue):
@@ -83,15 +101,23 @@ class ArchiveScanWorker(QObject):
                 self.archive_finished.emit(archive_path, groups, total_files, temp_handle)
             except MemoryError:
                 logger.error("内存不足，跳过压缩包: %s", archive_path)
-                self.error.emit(f"{Path(archive_path).name}: 内存不足，文件过大无法处理")
-                # 强制触发垃圾回收，尝试释放内存
                 import gc
                 gc.collect()
+                try:
+                    self.error.emit(f"{Path(archive_path).name}: 内存不足，文件过大无法处理")
+                except Exception:
+                    pass
             except Exception as exc:
                 logger.exception("扫描压缩包失败: %s", archive_path)
-                self.error.emit(f"{Path(archive_path).name}: {exc}")
+                try:
+                    self.error.emit(f"{Path(archive_path).name}: {exc}")
+                except Exception:
+                    pass
         if not self._stopped:
-            self.all_finished.emit()
+            try:
+                self.all_finished.emit()
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -536,14 +562,17 @@ class ArchiveScanTab(QWidget):
 
             # thumbnail from first file
             if g.files:
-                pm = QPixmap(g.files[0].file_path)
-                if not pm.isNull():
-                    icon = QIcon(pm.scaled(
-                        48, 48,
-                        Qt.AspectRatioMode.KeepAspectRatio,
-                        Qt.TransformationMode.SmoothTransformation,
-                    ))
-                    group_item.setIcon(0, icon)
+                try:
+                    pm = QPixmap(g.files[0].file_path)
+                    if not pm.isNull():
+                        icon = QIcon(pm.scaled(
+                            48, 48,
+                            Qt.AspectRatioMode.KeepAspectRatio,
+                            Qt.TransformationMode.SmoothTransformation,
+                        ))
+                        group_item.setIcon(0, icon)
+                except Exception:
+                    pass
 
             for f in g.files:
                 name = Path(f.file_path).name
@@ -558,14 +587,17 @@ class ArchiveScanTab(QWidget):
                 child.setCheckState(0, Qt.CheckState.Unchecked)
                 child.setData(2, _SORT_ROLE, f.file_size)
 
-                pm = QPixmap(f.file_path)
-                if not pm.isNull():
-                    icon = QIcon(pm.scaled(
-                        32, 32,
-                        Qt.AspectRatioMode.KeepAspectRatio,
-                        Qt.TransformationMode.SmoothTransformation,
-                    ))
-                    child.setIcon(0, icon)
+                try:
+                    pm = QPixmap(f.file_path)
+                    if not pm.isNull():
+                        icon = QIcon(pm.scaled(
+                            32, 32,
+                            Qt.AspectRatioMode.KeepAspectRatio,
+                            Qt.TransformationMode.SmoothTransformation,
+                        ))
+                        child.setIcon(0, icon)
+                except Exception:
+                    pass
 
                 group_item.addChild(child)
 

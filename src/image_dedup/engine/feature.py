@@ -30,19 +30,33 @@ class FeatureMatcher:
         self._ratio = ratio_threshold
         self._max_dim = max_dim
 
+    def _safe_resize(self, img: np.ndarray) -> np.ndarray:
+        """缩放过大的图片，防止 OpenCV 处理时内存溢出或崩溃。"""
+        h, w = img.shape[:2]
+        if max(h, w) > self._max_dim:
+            scale = self._max_dim / max(h, w)
+            img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        return img
+
     def compare_pair(self, img_a_path: str, img_b_path: str) -> FeatureMatch | None:
         try:
+            # 文件预检查
+            from pathlib import Path
+            for p in (img_a_path, img_b_path):
+                pp = Path(p)
+                if not pp.is_file() or pp.stat().st_size == 0:
+                    return None
+
             img_a = cv2.imread(img_a_path, cv2.IMREAD_GRAYSCALE)
             img_b = cv2.imread(img_b_path, cv2.IMREAD_GRAYSCALE)
             if img_a is None or img_b is None:
                 return None
+            if img_a.size == 0 or img_b.size == 0:
+                return None
 
             # Resize large images for speed
-            for img in (img_a, img_b):
-                h, w = img.shape[:2]
-                if max(h, w) > self._max_dim:
-                    scale = self._max_dim / max(h, w)
-                    img = cv2.resize(img, None, fx=scale, fy=scale)
+            img_a = self._safe_resize(img_a)
+            img_b = self._safe_resize(img_b)
 
             orb = cv2.ORB_create(nFeatures=self._n_features)
             kp_a, des_a = orb.detectAndCompute(img_a, None)

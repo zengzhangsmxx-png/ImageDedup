@@ -28,18 +28,32 @@ logger = get_logger("comparison_widget")
 
 def numpy_to_qpixmap(arr: np.ndarray) -> QPixmap:
     """Convert a numpy array (BGR or grayscale) to QPixmap."""
-    if arr.ndim == 2:
-        h, w = arr.shape
-        qimg = QImage(arr.data, w, h, w, QImage.Format.Format_Grayscale8)
-    else:
-        if arr.shape[2] == 3:
-            rgb = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
+    try:
+        if arr is None or arr.size == 0:
+            return QPixmap()
+        if arr.ndim == 2:
+            h, w = arr.shape
+            if h <= 0 or w <= 0:
+                return QPixmap()
+            arr = np.ascontiguousarray(arr)
+            qimg = QImage(arr.data, w, h, w, QImage.Format.Format_Grayscale8)
         else:
-            rgb = arr
-        h, w, ch = rgb.shape
-        bytes_per_line = ch * w
-        qimg = QImage(rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-    return QPixmap.fromImage(qimg.copy())
+            if len(arr.shape) < 3 or arr.shape[2] not in (3, 4):
+                return QPixmap()
+            if arr.shape[2] == 3:
+                rgb = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
+            else:
+                rgb = arr
+            h, w, ch = rgb.shape
+            if h <= 0 or w <= 0:
+                return QPixmap()
+            rgb = np.ascontiguousarray(rgb)
+            bytes_per_line = ch * w
+            qimg = QImage(rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+        return QPixmap.fromImage(qimg.copy())
+    except Exception as e:
+        logger.debug("numpy_to_qpixmap 转换失败: %s", e)
+        return QPixmap()
 
 
 class ZoomPanViewer(QGraphicsView):

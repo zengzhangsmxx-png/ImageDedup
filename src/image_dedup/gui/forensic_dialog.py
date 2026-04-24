@@ -115,16 +115,35 @@ class ForensicDialog(QDialog):
             return
         self._loaded_tabs.add(index)
         pa, pb = self._path_a(), self._path_b()
-        if index == 0:
-            self._load_metadata(pa, pb)
-        elif index == 1:
-            self._load_pixel_diff(pa, pb)
-        elif index == 2:
-            self._load_ela(pa, pb)
-        elif index == 3:
-            self._load_noise(pa, pb)
-        elif index == 4:
-            self._load_lighting(pa, pb)
+        try:
+            if index == 0:
+                self._load_metadata(pa, pb)
+            elif index == 1:
+                self._load_pixel_diff(pa, pb)
+            elif index == 2:
+                self._load_ela(pa, pb)
+            elif index == 3:
+                self._load_noise(pa, pb)
+            elif index == 4:
+                self._load_lighting(pa, pb)
+        except MemoryError:
+            import gc
+            gc.collect()
+            # 在对应 tab 中显示错误信息
+            tabs = [self._tab_metadata, self._tab_pixel, self._tab_ela,
+                    self._tab_noise, self._tab_lighting]
+            if 0 <= index < len(tabs):
+                self._clear_layout(tabs[index])
+                tabs[index].layout().addWidget(QLabel("内存不足，无法执行此分析"))
+        except Exception as e:
+            tabs = [self._tab_metadata, self._tab_pixel, self._tab_ela,
+                    self._tab_noise, self._tab_lighting]
+            if 0 <= index < len(tabs):
+                try:
+                    self._clear_layout(tabs[index])
+                    tabs[index].layout().addWidget(QLabel(f"分析失败: {e}"))
+                except Exception:
+                    pass
 
     def _clear_layout(self, widget: QWidget):
         layout = widget.layout()

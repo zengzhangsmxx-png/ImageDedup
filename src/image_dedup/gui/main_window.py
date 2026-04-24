@@ -69,6 +69,24 @@ class ScanWorker(QObject):
 
     def run(self):
         try:
+            self._run_inner()
+        except MemoryError:
+            import gc
+            gc.collect()
+            logger.critical("ScanWorker: 内存不足，扫描中止")
+            try:
+                self.error.emit("内存不足，扫描已中止。请减少扫描文件数量或关闭其他程序后重试。")
+            except Exception:
+                pass
+        except Exception as e:
+            logger.exception("ScanWorker: 扫描异常")
+            try:
+                self.error.emit(str(e))
+            except Exception:
+                pass
+
+    def _run_inner(self):
+        try:
             scanner = Scanner()
             cache = HashCache()
             scan_errors = ScanErrors()
@@ -210,8 +228,8 @@ class ScanWorker(QObject):
             # Don't cleanup — MainWindow holds scanner alive until next scan / close
             self.finished.emit(all_groups, scanner, scan_errors, delta_info)
         except Exception as e:
-            logger.exception("Scan failed")
-            self.error.emit(str(e))
+            logger.exception("_run_inner failed")
+            raise  # Re-raise to outer handler
 
     def _run_dedup(self, files, cache, gid_offset, scan_errors=None) -> list[DuplicateGroup]:
         hasher = HashEngine(cache, max_workers=self._config.max_workers, config=self._config)

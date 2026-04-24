@@ -59,6 +59,14 @@ def _compute_single(file_path: str, top_crop_ratio: float = 0.08) -> dict | None
     """Compute all hashes for one image. Runs in a worker process."""
     try:
         path = Path(file_path)
+
+        # 文件大小预检查 — 跳过过大文件避免内存溢出
+        file_stat = path.stat()
+        if file_stat.st_size > 500 * 1024 * 1024:  # 500MB
+            return {"_error": True, "file_path": file_path, "message": "文件过大 (>500MB)，跳过"}
+        if file_stat.st_size == 0:
+            return {"_error": True, "file_path": file_path, "message": "空文件"}
+
         data = path.read_bytes()
         md5 = hashlib.md5(data).hexdigest()
         sha256 = hashlib.sha256(data).hexdigest()
@@ -66,6 +74,17 @@ def _compute_single(file_path: str, top_crop_ratio: float = 0.08) -> dict | None
         img = Image.open(path)
         img.load()
         w, h = img.size
+
+        # 图片尺寸预检查 — 超大图片先缩放，避免 C 扩展崩溃
+        MAX_PIXELS = 178_000_000  # ~13K x 13K, PIL 默认限制
+        if w * h > MAX_PIXELS:
+            scale = (MAX_PIXELS / (w * h)) ** 0.5
+            new_w, new_h = int(w * scale), int(h * scale)
+            img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+            # 保留原始尺寸用于记录
+        if w <= 0 or h <= 0:
+            return {"_error": True, "file_path": file_path, "message": "无效图片尺寸"}
+
         if img.mode not in ("RGB", "L"):
             img = img.convert("RGB")
 
@@ -84,6 +103,8 @@ def _compute_single(file_path: str, top_crop_ratio: float = 0.08) -> dict | None
             file_size=len(data), width=w, height=h,
             computed_at=time.time(),
         )
+    except MemoryError:
+        return {"_error": True, "file_path": file_path, "message": "内存不足"}
     except Exception as e:
         return {"_error": True, "file_path": file_path, "message": str(e)}
 

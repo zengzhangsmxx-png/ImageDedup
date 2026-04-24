@@ -230,11 +230,14 @@ class ResultsView(QWidget):
 
             # Set icon thumbnail from first file
             if g.files:
-                pm = QPixmap(g.files[0].file_path)
-                if not pm.isNull():
-                    icon = QIcon(pm.scaled(48, 48, Qt.AspectRatioMode.KeepAspectRatio,
-                                           Qt.TransformationMode.SmoothTransformation))
-                    group_item.setIcon(0, icon)
+                try:
+                    pm = QPixmap(g.files[0].file_path)
+                    if not pm.isNull():
+                        icon = QIcon(pm.scaled(48, 48, Qt.AspectRatioMode.KeepAspectRatio,
+                                               Qt.TransformationMode.SmoothTransformation))
+                        group_item.setIcon(0, icon)
+                except Exception:
+                    pass
 
             for f in g.files:
                 name = Path(f.file_path).name
@@ -250,11 +253,14 @@ class ResultsView(QWidget):
                 child.setData(3, _SORT_ROLE, f.file_size)
 
                 # Thumbnail
-                pm = QPixmap(f.file_path)
-                if not pm.isNull():
-                    icon = QIcon(pm.scaled(32, 32, Qt.AspectRatioMode.KeepAspectRatio,
-                                           Qt.TransformationMode.SmoothTransformation))
-                    child.setIcon(0, icon)
+                try:
+                    pm = QPixmap(f.file_path)
+                    if not pm.isNull():
+                        icon = QIcon(pm.scaled(32, 32, Qt.AspectRatioMode.KeepAspectRatio,
+                                               Qt.TransformationMode.SmoothTransformation))
+                        child.setIcon(0, icon)
+                except Exception:
+                    pass
 
                 group_item.addChild(child)
 

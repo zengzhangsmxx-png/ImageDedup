@@ -124,12 +124,33 @@ class ImageViewerDialog(QDialog):
             return
         self._loaded_tabs.add(index)
 
-        if index == 1:
-            self._load_ela()
-        elif index == 2:
-            self._load_noise()
-        elif index == 3:
-            self._load_lighting()
+        try:
+            if index == 1:
+                self._load_ela()
+            elif index == 2:
+                self._load_noise()
+            elif index == 3:
+                self._load_lighting()
+        except MemoryError:
+            import gc
+            gc.collect()
+            tabs = {1: self._tab_ela, 2: self._tab_noise, 3: self._tab_lighting}
+            tab = tabs.get(index)
+            if tab:
+                try:
+                    self._clear_layout(tab)
+                    tab.layout().addWidget(self._make_label("内存不足，无法执行此分析"))
+                except Exception:
+                    pass
+        except Exception as e:
+            tabs = {1: self._tab_ela, 2: self._tab_noise, 3: self._tab_lighting}
+            tab = tabs.get(index)
+            if tab:
+                try:
+                    self._clear_layout(tab)
+                    tab.layout().addWidget(self._make_label(f"分析失败: {e}"))
+                except Exception:
+                    pass
 
     def _clear_layout(self, widget: QWidget):
         layout = widget.layout()

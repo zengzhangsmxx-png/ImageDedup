@@ -27,18 +27,33 @@ logger = get_logger("widgets")
 
 def numpy_to_qpixmap(arr: np.ndarray) -> QPixmap:
     """Convert a numpy array (BGR or grayscale) to QPixmap."""
-    if arr.ndim == 2:
-        h, w = arr.shape
-        qimg = QImage(arr.data, w, h, w, QImage.Format.Format_Grayscale8)
-    else:
-        if arr.shape[2] == 3:
-            rgb = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
+    try:
+        if arr is None or arr.size == 0:
+            return QPixmap()
+        if arr.ndim == 2:
+            h, w = arr.shape
+            if h <= 0 or w <= 0:
+                return QPixmap()
+            # 确保数据连续
+            arr = np.ascontiguousarray(arr)
+            qimg = QImage(arr.data, w, h, w, QImage.Format.Format_Grayscale8)
         else:
-            rgb = arr
-        h, w, ch = rgb.shape
-        bytes_per_line = ch * w
-        qimg = QImage(rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-    return QPixmap.fromImage(qimg.copy())
+            if len(arr.shape) < 3 or arr.shape[2] not in (3, 4):
+                return QPixmap()
+            if arr.shape[2] == 3:
+                rgb = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
+            else:
+                rgb = arr
+            h, w, ch = rgb.shape
+            if h <= 0 or w <= 0:
+                return QPixmap()
+            rgb = np.ascontiguousarray(rgb)
+            bytes_per_line = ch * w
+            qimg = QImage(rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+        return QPixmap.fromImage(qimg.copy())
+    except Exception as e:
+        logger.debug("numpy_to_qpixmap 转换失败: %s", e)
+        return QPixmap()
 
 
 class ImageViewer(QLabel):
@@ -214,10 +229,26 @@ class ExtractionWorker(QThread):
         try:
             _recursive_extract(self.archive_path, self.dest_dir)
             if not self._cancelled:
-                self.finished.emit(self.dest_dir)
-        except Exception as e:
+                try:
+                    self.finished.emit(self.dest_dir)
+                except Exception:
+                    pass
+        except MemoryError:
+            import gc
+            gc.collect()
+            logger.error("ExtractionWorker: 内存不足，解压失败: %s", self.archive_path)
             if not self._cancelled:
-                self.error.emit(str(e))
+                try:
+                    self.error.emit("内存不足，无法解压此文件")
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.exception("ExtractionWorker: 解压失败: %s", self.archive_path)
+            if not self._cancelled:
+                try:
+                    self.error.emit(str(e))
+                except Exception:
+                    pass
 
     def cancel(self):
         self._cancelled = True

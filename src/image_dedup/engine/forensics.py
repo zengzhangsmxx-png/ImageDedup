@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -84,14 +85,39 @@ def _extract_exif(path: str) -> dict[str, str]:
 
 
 def _load_cv2_rgb(path: str, max_dim: int = 2048) -> np.ndarray | None:
-    img = cv2.imread(path)
-    if img is None:
+    try:
+        # 文件预检查
+        p = Path(path)
+        if not p.is_file():
+            return None
+        if p.stat().st_size == 0:
+            return None
+        if p.stat().st_size > 500 * 1024 * 1024:  # 500MB
+            logger.warning("文件过大，跳过加载: %s", path)
+            return None
+
+        img = cv2.imread(path)
+        if img is None:
+            return None
+
+        # 验证图片数据有效性
+        if img.size == 0 or len(img.shape) < 2:
+            return None
+
+        h, w = img.shape[:2]
+        if h <= 0 or w <= 0:
+            return None
+
+        if max(h, w) > max_dim:
+            scale = max_dim / max(h, w)
+            img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        return img
+    except MemoryError:
+        logger.warning("内存不足，无法加载图片: %s", path)
         return None
-    h, w = img.shape[:2]
-    if max(h, w) > max_dim:
-        scale = max_dim / max(h, w)
-        img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-    return img
+    except Exception as e:
+        logger.debug("加载图片失败 %s: %s", path, e)
+        return None
 
 
 def _align_sizes(a: np.ndarray, b: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
